@@ -1,32 +1,39 @@
-pub mod todoapp;
+use tasksapp_net::{Task, TaskResult};
 
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-use crate::{Priority, Task, TodoApp};
-
-static TODOAPP: Lazy<TodoApp> = Lazy::new(|| TodoApp::new());
+static DB: Lazy<RefCell<HashMap<i32, Task>>> = Lazy::new(|| RefCell::new(HashMap::new()));
 
 #[no_mangle]
-pub extern "C" fn allocate(size: u32) -> *mut u8 {
-    let mut buf = Vec::with_capacity(size as usize);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[no_mangle]
-pub extern "C" fn deallocate(ptr: *mut u8, size: u32) {
-    unsafe {
-        Vec::from_raw_parts(ptr, size as usize, size as usize);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn new_task(task_ptr: i32, task_len: i32) -> i32  {
+pub extern "C" fn new_task(title_ptr: i32, title_len: i32, priority: i32) -> (i32, i32) {
     unimplemented!();
 }
 
 #[no_mangle]
-pub extern "C" fn pending_tasks() -> *const u8 {
+pub extern "C" fn show_pending_tasks() -> (i32, i32) {
     unimplemented!();
 }
+
+#[no_mangle]
+pub extern "C" fn show_completed_tasks() -> (i32, i32) {
+    unimplemented!();
+}
+
+#[no_mangle]
+pub extern "C" fn mark_as_completed(task_id: i32) {
+    unimplemented!();
+}
+
+#[no_mangle]
+pub extern "C" fn change_priority(task_id: i32) {
+    unimplemented!();
+}
+
+#[no_mangle]
+pub extern "C" fn change_title(task_id: i32) {
+    unimplemented!();
+}
+
+#[no_mangle]
+pub extern "C" fn query_by_id(task_id: i32) -> (i32, i32) {
+    unimplemented!();
+}
+
