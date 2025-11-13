@@ -1,0 +1,1 @@
+/home/gero/Documents/projects/wasm_plugins/xxxx/plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm: /home/gero/Documents/projects/wasm_plugins/xxxx/net-crates/tasksapp-net/src/lib.rs /home/gero/Documents/projects/wasm_plugins/xxxx/plugins/tasksapp-core/src/lib.rs

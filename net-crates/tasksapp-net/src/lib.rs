@@ -1,25 +1,32 @@
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Task {
-    id: i32,
-    title: String,
-    priority: u8,
-    completed: bool,
+    pub id: i32,
+    pub title: String,
+    pub priority: u8,
+    pub completed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum NewTaskError {
     TaskAlreadyExists,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum NewTaskResult {
     Success(Task),
     Error(NewTaskError),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NewTaskRequest {
+    pub title: String,
+    pub priority: u8,
+    pub completed: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub enum QueryByIdResult {
     Success(Task),
     NotFoundError,
