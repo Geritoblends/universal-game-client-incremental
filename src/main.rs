@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Test: Create a task
     let create_task = instance_client
-        .get_typed_func::<(i32, i32, u8), (i32, i32)>(&mut store, "create_task")?;
+        .get_typed_func::<(i32, i32, i32), (i32, i32)>(&mut store, "create_task")?;
     
     let title = "Learn Wasmtime Shared Memory";
     let mem = instance_client.get_memory(&mut store, "memory").expect("memory export");

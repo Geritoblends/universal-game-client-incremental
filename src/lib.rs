@@ -1,3 +1,5 @@
+// Added `anyhow` imports
+use anyhow::{anyhow, Result};
 use wasmtime::*;
 use std::collections::HashMap;
 
@@ -13,11 +15,11 @@ pub fn call(
     func_name_len: i32,
     payload_ptr: i32,
     payload_len: i32,
-) -> Result<(i32, i32), Trap> {
+) -> Result<(i32, i32)> {
     let mem = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
     
     let mem_data = mem.data(&caller);
     
@@ -31,18 +33,18 @@ pub fn call(
         .data()
         .instances
         .get(&instance_id)
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("instance '{}' not found in host state", instance_id))?
+        .clone(); // <-- FIX: Added clone to resolve borrow error
     
     let func = instance
         .get_export(&mut caller, &func_name)
         .and_then(|e| e.into_func())
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("function '{}' not found in instance '{}'", func_name, instance_id))?;
     
     let typed = func
         .typed::<(i32, i32), (i32, i32)>(&caller)
-        .map_err(|_| Trap::i32_exit(1))?;
+        .map_err(|_| anyhow!("function '{}' has incorrect signature", func_name))?;
     
-    // The magic: these pointers work because both modules share memory!
     typed.call(&mut caller, (payload_ptr, payload_len))
 }
 
@@ -50,11 +52,11 @@ pub fn send_to_server(
     mut caller: Caller<'_, HostState>,
     message_ptr: i32,
     message_len: i32,
-) -> Result<(), Trap> {
+) -> Result<()> {
     let mem = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
     
     let mem_data = mem.data(&caller);
     let message_bytes = &mem_data[message_ptr as usize..(message_ptr + message_len) as usize];
@@ -71,12 +73,12 @@ pub fn fire_and_forget(
     func_ptr: i32,
     func_len: i32,
     payload_ptr: i32,
-    payload_len: i32,
-) -> Result<(), Trap> {
+    _payload_len: i32, // <-- FIX: Added underscore for unused variable
+) -> Result<()> {
     let mem = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
     
     let mem_data = mem.data(&caller);
     
@@ -90,33 +92,35 @@ pub fn fire_and_forget(
         .data()
         .instances
         .get(&instance_id)
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("instance '{}' not found in host state", instance_id))?
+        .clone(); // <-- FIX: Added clone to resolve borrow error
     
     let func = instance
         .get_export(&mut caller, &func_name)
         .and_then(|e| e.into_func())
-        .ok_or_else(|| Trap::i32_exit(1))?;
+        .ok_or_else(|| anyhow!("function '{}' not found in instance '{}'", func_name, instance_id))?;
     
     let typed = func
         .typed::<i32, ()>(&caller)
-        .map_err(|_| Trap::i32_exit(1))?;
+        .map_err(|_| anyhow!("function '{}' has incorrect signature", func_name))?;
     
     typed.call(&mut caller, payload_ptr)?;
     Ok(())
 }
 
-pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance), Box<dyn std::error::Error>> {
+// Changed: Return type is now anyhow::Result for consistency
+pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
     let engine = Engine::default();
     let mut store = Store::new(&engine, HostState {
         instances: HashMap::new(),
     });
     
     // Create shared memory
-    let memory_type = MemoryType::new(10, Some(100));
+    let memory_type = MemoryType::new(17, None);
     let shared_memory = Memory::new(&mut store, memory_type)?;
     
     // Load and link tasksapp_core
-    let module_core = Module::from_file(&engine, "target/wasm32-unknown-unknown/release/tasksapp_core.wasm")?;
+    let module_core = Module::from_file(&engine, "plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm")?;
     let mut linker_core = Linker::new(&engine);
     linker_core.define(&store, "env", "memory", shared_memory)?;
     linker_core.func_wrap("env", "call", call)?;
@@ -125,7 +129,7 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance), Box<dyn
     let instance_core = linker_core.instantiate(&mut store, &module_core)?;
     
     // Load and link tasksapp_client with SAME memory
-    let module_client = Module::from_file(&engine, "target/wasm32-unknown-unknown/release/tasksapp_client.wasm")?;
+    let module_client = Module::from_file(&engine, "plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm")?;
     let mut linker_client = Linker::new(&engine);
     linker_client.define(&store, "env", "memory", shared_memory)?;
     linker_client.func_wrap("env", "call", call)?;
