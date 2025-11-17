@@ -1,7 +1,7 @@
 // Added `anyhow` imports
-use anyhow::{anyhow, Result};
-use wasmtime::*;
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
+use wasmtime::*;
 
 pub struct HostState {
     pub instances: HashMap<String, Instance>,
@@ -15,37 +15,70 @@ pub fn call(
     func_name_len: i32,
     payload_ptr: i32,
     payload_len: i32,
-) -> Result<(i32, i32)> {
+    result_ptr: i32, // <-- FIX 1: Add the 7th parameter (the result pointer)
+) -> Result<()> {
+    // <-- FIX 2: Change return type to void
+
+    // --- (This part is the same as before) ---
     let mem = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
-    
+
     let mem_data = mem.data(&caller);
-    
-    let instance_id_bytes = &mem_data[instance_id_ptr as usize..(instance_id_ptr + instance_id_len) as usize];
-    let func_name_bytes = &mem_data[func_name_ptr as usize..(func_name_ptr + func_name_len) as usize];
-    
+
+    let instance_id_bytes =
+        &mem_data[instance_id_ptr as usize..(instance_id_ptr + instance_id_len) as usize];
+    let func_name_bytes =
+        &mem_data[func_name_ptr as usize..(func_name_ptr + func_name_len) as usize];
+
     let instance_id = String::from_utf8_lossy(instance_id_bytes).to_string();
     let func_name = String::from_utf8_lossy(func_name_bytes).to_string();
-    
+
     let instance = caller
         .data()
         .instances
         .get(&instance_id)
         .ok_or_else(|| anyhow!("instance '{}' not found in host state", instance_id))?
-        .clone(); // <-- FIX: Added clone to resolve borrow error
-    
+        .clone();
+
     let func = instance
         .get_export(&mut caller, &func_name)
         .and_then(|e| e.into_func())
-        .ok_or_else(|| anyhow!("function '{}' not found in instance '{}'", func_name, instance_id))?;
-    
+        .ok_or_else(|| {
+            anyhow!(
+                "function '{}' not found in instance '{}'",
+                func_name,
+                instance_id
+            )
+        })?;
+
     let typed = func
         .typed::<(i32, i32), (i32, i32)>(&caller)
         .map_err(|_| anyhow!("function '{}' has incorrect signature", func_name))?;
-    
-    typed.call(&mut caller, (payload_ptr, payload_len))
+
+    // --- (This part changes) ---
+
+    // FIX 3: Call the function and get the (i32, i32) result
+    let (ret_ptr, ret_len) = typed.call(&mut caller, (payload_ptr, payload_len))?;
+
+    // FIX 4: Write the two i32 results back to Wasm memory at the pointer
+    // We need to re-get 'mem' as a mutable memory object to write
+    let mem = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
+
+    // `(i32, i32)` is 8 bytes. Write the first i32, then the second.
+    // We write in Little Endian (LE) bytes, which is standard for Wasm.
+    mem.write(&mut caller, result_ptr as usize, &ret_ptr.to_le_bytes())?;
+    mem.write(
+        &mut caller,
+        (result_ptr + 4) as usize,
+        &ret_len.to_le_bytes(),
+    )?;
+
+    Ok(())
 }
 
 pub fn send_to_server(
@@ -57,10 +90,10 @@ pub fn send_to_server(
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
-    
+
     let mem_data = mem.data(&caller);
     let message_bytes = &mem_data[message_ptr as usize..(message_ptr + message_len) as usize];
-    
+
     println!("📤 Server received: {} bytes", message_bytes.len());
     println!("   Message: {}", String::from_utf8_lossy(message_bytes));
     Ok(())
@@ -79,31 +112,38 @@ pub fn fire_and_forget(
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
-    
+
     let mem_data = mem.data(&caller);
-    
-    let instance_id_bytes = &mem_data[instance_id_ptr as usize..(instance_id_ptr + instance_id_len) as usize];
+
+    let instance_id_bytes =
+        &mem_data[instance_id_ptr as usize..(instance_id_ptr + instance_id_len) as usize];
     let func_name_bytes = &mem_data[func_ptr as usize..(func_ptr + func_len) as usize];
-    
+
     let instance_id = String::from_utf8_lossy(instance_id_bytes).to_string();
     let func_name = String::from_utf8_lossy(func_name_bytes).to_string();
-    
+
     let instance = caller
         .data()
         .instances
         .get(&instance_id)
         .ok_or_else(|| anyhow!("instance '{}' not found in host state", instance_id))?
         .clone(); // <-- FIX: Added clone to resolve borrow error
-    
+
     let func = instance
         .get_export(&mut caller, &func_name)
         .and_then(|e| e.into_func())
-        .ok_or_else(|| anyhow!("function '{}' not found in instance '{}'", func_name, instance_id))?;
-    
+        .ok_or_else(|| {
+            anyhow!(
+                "function '{}' not found in instance '{}'",
+                func_name,
+                instance_id
+            )
+        })?;
+
     let typed = func
         .typed::<i32, ()>(&caller)
         .map_err(|_| anyhow!("function '{}' has incorrect signature", func_name))?;
-    
+
     typed.call(&mut caller, payload_ptr)?;
     Ok(())
 }
@@ -111,35 +151,50 @@ pub fn fire_and_forget(
 // Changed: Return type is now anyhow::Result for consistency
 pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
     let engine = Engine::default();
-    let mut store = Store::new(&engine, HostState {
-        instances: HashMap::new(),
-    });
-    
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            instances: HashMap::new(),
+        },
+    );
+
     // Create shared memory
     let memory_type = MemoryType::new(17, None);
     let shared_memory = Memory::new(&mut store, memory_type)?;
-    
+
     // Load and link tasksapp_core
-    let module_core = Module::from_file(&engine, "plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm")?;
+    let module_core = Module::from_file(
+        &engine,
+        "plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm",
+    )?;
     let mut linker_core = Linker::new(&engine);
     linker_core.define(&store, "env", "memory", shared_memory)?;
     linker_core.func_wrap("env", "call", call)?;
     linker_core.func_wrap("env", "send_to_server", send_to_server)?;
     linker_core.func_wrap("env", "fire_and_forget", fire_and_forget)?;
     let instance_core = linker_core.instantiate(&mut store, &module_core)?;
-    
+
     // Load and link tasksapp_client with SAME memory
-    let module_client = Module::from_file(&engine, "plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm")?;
+    let module_client = Module::from_file(
+        &engine,
+        "plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm",
+    )?;
     let mut linker_client = Linker::new(&engine);
     linker_client.define(&store, "env", "memory", shared_memory)?;
     linker_client.func_wrap("env", "call", call)?;
     linker_client.func_wrap("env", "send_to_server", send_to_server)?;
     linker_client.func_wrap("env", "fire_and_forget", fire_and_forget)?;
     let instance_client = linker_client.instantiate(&mut store, &module_client)?;
-    
+
     // Register instances
-    store.data_mut().instances.insert("tasksapp_core".to_string(), instance_core.clone());
-    store.data_mut().instances.insert("tasksapp_client".to_string(), instance_client.clone());
-    
+    store
+        .data_mut()
+        .instances
+        .insert("tasksapp_core".to_string(), instance_core.clone());
+    store
+        .data_mut()
+        .instances
+        .insert("tasksapp_client".to_string(), instance_client.clone());
+
     Ok((store, instance_core, instance_client))
 }

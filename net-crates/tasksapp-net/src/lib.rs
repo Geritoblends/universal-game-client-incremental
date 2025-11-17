@@ -1,10 +1,10 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Task {
     pub id: i32,
     pub title: String,
-    pub priority: u8,
+    pub priority: i32,
     pub completed: bool,
 }
 
@@ -22,7 +22,7 @@ pub enum NewTaskResult {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NewTaskRequest {
     pub title: String,
-    pub priority: u8,
+    pub priority: i32,
     pub completed: bool,
 }
 
