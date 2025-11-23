@@ -1,1 +1,0 @@
-/home/gero/projects/universal-game-client-incremental/plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm: /home/gero/projects/universal-game-client-incremental/net-crates/tasksapp-net/src/lib.rs /home/gero/projects/universal-game-client-incremental/plugins/tasksapp-client/src/lib.rs
