@@ -1,10 +1,43 @@
 use once_cell::sync::Lazy;
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tasksapp_net::{NewTaskError, NewTaskRequest, NewTaskResult, QueryByIdResult, Task};
+
+// ============================================================================
+//  THE SYSTEM ALLOCATOR (Fixed for Rust 2024 Strictness)
+// ============================================================================
 
 unsafe extern "C" {
+    fn host_alloc(size: i32) -> i32;
+    fn host_dealloc(ptr: i32, size: i32);
     fn host_print(ptr: i32, len: i32);
 }
+
+struct HostAllocator;
+
+unsafe impl GlobalAlloc for HostAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Rust 2024: Must wrap unsafe calls in unsafe block, even inside unsafe fn
+        unsafe {
+            let ptr = host_alloc(layout.size() as i32);
+            ptr as *mut u8
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            host_dealloc(ptr as i32, layout.size() as i32);
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: HostAllocator = HostAllocator;
+
+// ============================================================================
+//  BUSINESS LOGIC
+// ============================================================================
 
 fn print(s: &str) {
     unsafe {
@@ -12,17 +45,13 @@ fn print(s: &str) {
     }
 }
 
-// NOTE: tasksapp_net must contain these definitions
-use tasksapp_net::{NewTaskError, NewTaskRequest, NewTaskResult, QueryByIdResult, Task};
-
 static DB: Lazy<Mutex<HashMap<i32, Task>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static mut CURRENT_ID: i32 = 0;
 
-/// Exports the function to create a new task.
-/// Returns a packed i64 representing (ptr, len) of the serialized NewTaskResult.
 #[unsafe(no_mangle)]
 pub fn new_task(payload_ptr: i32, payload_len: i32) -> i64 {
     print(&format!("Hello from Core!"));
+
     let payload = unsafe {
         let slice = std::slice::from_raw_parts(payload_ptr as *const u8, payload_len as usize);
         slice.to_vec()
@@ -32,13 +61,11 @@ pub fn new_task(payload_ptr: i32, payload_len: i32) -> i64 {
         Ok(req) => req,
         Err(_) => {
             print(&format!("Error deserializing request"));
-            // Handle deserialization error
-            let result = NewTaskResult::Error(NewTaskError::TaskAlreadyExists); // Using placeholder error
+            let result = NewTaskResult::Error(NewTaskError::TaskAlreadyExists);
             let serialized = bincode::serialize(&result).unwrap();
             let ptr = serialized.as_ptr() as i32;
             let len = serialized.len() as i32;
             std::mem::forget(serialized);
-            // Pack and return on error path
             return (ptr as i64) << 32 | (len as i64);
         }
     };
@@ -63,18 +90,15 @@ pub fn new_task(payload_ptr: i32, payload_len: i32) -> i64 {
     let result = NewTaskResult::Success(task);
     print(&format!("Returning result: {:?}", result));
     print(&format!("Goodbye from Core!"));
-    let serialized = bincode::serialize(&result).unwrap();
 
+    let serialized = bincode::serialize(&result).unwrap();
     let ptr = serialized.as_ptr() as i32;
     let len = serialized.len() as i32;
     std::mem::forget(serialized);
 
-    // Pack and return on success path
     (ptr as i64) << 32 | (len as i64)
 }
 
-/// Exports the function to list all pending tasks.
-/// Returns a packed i64 representing (ptr, len) of the serialized Vec<Task>.
 #[unsafe(no_mangle)]
 pub fn show_pending_tasks() -> i64 {
     let db = DB.lock().unwrap();
@@ -85,12 +109,9 @@ pub fn show_pending_tasks() -> i64 {
     let len = serialized.len() as i32;
     std::mem::forget(serialized);
 
-    // Pack and return
     (ptr as i64) << 32 | (len as i64)
 }
 
-/// Exports the function to list all completed tasks.
-/// Returns a packed i64 representing (ptr, len) of the serialized Vec<Task>.
 #[unsafe(no_mangle)]
 pub fn show_completed_tasks() -> i64 {
     let db = DB.lock().unwrap();
@@ -101,7 +122,6 @@ pub fn show_completed_tasks() -> i64 {
     let len = serialized.len() as i32;
     std::mem::forget(serialized);
 
-    // Pack and return
     (ptr as i64) << 32 | (len as i64)
 }
 
@@ -134,14 +154,13 @@ pub fn change_title(task_id: i32, title_ptr: i32, title_len: i32) {
     }
 }
 
-/// Exports the function to query a task by ID.
-/// Returns a packed i64 representing (ptr, len) of the serialized QueryByIdResult.
 #[unsafe(no_mangle)]
 pub fn query_by_id(task_id: i32) -> i64 {
     let db = DB.lock().unwrap();
 
     let result = match db.get(&task_id) {
-        Some(task) => QueryByIdResult::Success(task.clone()),
+        // FIX: Explicitly dereference task to clone the struct, not the reference
+        Some(task) => QueryByIdResult::Success((*task).clone()),
         None => QueryByIdResult::NotFoundError,
     };
 
@@ -150,15 +169,5 @@ pub fn query_by_id(task_id: i32) -> i64 {
     let len = serialized.len() as i32;
     std::mem::forget(serialized);
 
-    // Pack and return
     (ptr as i64) << 32 | (len as i64)
-}
-
-/// Exports a deallocation function for the Host to manage Wasm memory.
-#[unsafe(no_mangle)]
-pub fn dealloc(ptr: i32, len: i32) {
-    unsafe {
-        // Reconstitutes the Vec<u8> from the raw parts and lets it drop, freeing the memory.
-        let _ = Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
-    }
 }

@@ -3,6 +3,21 @@ target = "wasm32-unknown-unknown"
 
 [target.wasm32-unknown-unknown]
 rustflags = [
-    "-C", "target-feature=+atomics",
-    "-C", "target-feature=+bulk-memory",
+  # 1. Threading Support
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  
+  # 2. Shared Memory Specs
+  # We do NOT need --import-memory here because -shared implies it.
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--max-memory=16777216", 
+
+  # 3. Dynamic Linking / Side Module
+  "-C", "link-arg=-shared",
+  "-C", "relocation-model=pic",
+  
+  # 4. Fix "GOT.func" / Serde errors (Bake dependencies in)
+  "-C", "link-arg=-Bsymbolic",
 ]
+
+[unstable]
+build-std = ["std", "panic_abort"]
