@@ -15,10 +15,10 @@ unsafe impl Send for SystemAllocator {}
 pub struct HostState {
     pub instances: HashMap<String, Instance>,
     pub shared_memory: SharedMemory,
-    pub table: Option<Table>,
+    // [REMOVED] pub table: Option<Table>, <-- No more global table
     pub next_memory_offset: i32,
     pub next_stack_offset: i32,
-    pub next_table_offset: i32,
+    // [REMOVED] pub next_table_offset: i32, <-- No more table tetris
     pub heap_allocator: Arc<Mutex<SystemAllocator>>,
 }
 
@@ -28,20 +28,36 @@ unsafe fn shared_memory_slice(data: &[UnsafeCell<u8>]) -> &[u8] {
 
 // --- EXPORTS ---
 
-pub fn host_alloc(caller: Caller<'_, HostState>, size: i32) -> i32 {
+pub fn host_alloc(mut caller: Caller<'_, HostState>, size: i32) -> i32 {
+    let memory = caller.data().shared_memory.clone();
+    let mem_base = memory.data().as_ptr() as usize;
+
     let mut wrapper = caller.data().heap_allocator.lock().unwrap();
     let ptr = wrapper.0.malloc(size as usize);
-    ptr as usize as i32
+
+    if ptr.is_null() { return 0; }
+
+    let offset = (ptr as usize) - mem_base;
+    if offset > 16777216 {
+        eprintln!("CRITICAL: Allocator returned out-of-bounds offset: {}", offset);
+    }
+    offset as i32
 }
 
-pub fn host_dealloc(caller: Caller<'_, HostState>, ptr: i32, _size: i32) {
+pub fn host_dealloc(mut caller: Caller<'_, HostState>, ptr: i32, _size: i32) {
+    if ptr == 0 { return; }
+    let memory = caller.data().shared_memory.clone();
+    let mem_base = memory.data().as_ptr() as usize;
+    let host_ptr = (mem_base + ptr as usize) as *mut u8;
+
     let mut wrapper = caller.data().heap_allocator.lock().unwrap();
-    wrapper.0.free(ptr as *mut u8);
+    wrapper.0.free(host_ptr);
 }
 
 pub fn host_print(caller: Caller<'_, HostState>, message_ptr: i32, message_len: i32) -> Result<()> {
     let mem_data = caller.data().shared_memory.data();
     let mem_slice = unsafe { shared_memory_slice(mem_data) };
+    
     let message_bytes = &mem_slice[message_ptr as usize..(message_ptr + message_len) as usize];
     let message = String::from_utf8_lossy(message_bytes);
     println!("[Guest Log] {}", message);
@@ -85,7 +101,7 @@ pub fn call(
 // --- DYNAMIC LINKER ---
 
 pub fn instantiate_plugin(
-    base_linker: &Linker<HostState>, // Read-only reference to base definitions
+    base_linker: &Linker<HostState>,
     store: &mut Store<HostState>,
     module: &Module,
     name: &str, 
@@ -93,21 +109,33 @@ pub fn instantiate_plugin(
     
     println!("--- Instantiating {} ---", name);
 
-    // 1. Assign Slots
+    // 1. Assign Slots (Memory & Stack still shared/tiled)
     let memory_base = store.data().next_memory_offset;
     store.data_mut().next_memory_offset += 1024 * 1024; 
+
     let stack_base = store.data().next_stack_offset;
     store.data_mut().next_stack_offset += 64 * 1024; 
-    let table_base = store.data().next_table_offset;
-    store.data_mut().next_table_offset += 1000; 
 
-    // 2. Create Globals
+    // [FIX] PRIVATE TABLES
+    // We do NOT increment a global table offset. 
+    // Every plugin gets its own table starting at 0.
+    let table_base = 0;
+
+    // 2. Create the PRIVATE Table for this plugin
+    let local_table = Table::new(
+        &mut *store,
+        TableType::new(RefType::FUNCREF, 1000, None),
+        Ref::Func(None),
+    )?;
+
+    // 3. Create Globals
     let memory_base_global = Global::new(
         &mut *store,
         GlobalType::new(ValType::I32, Mutability::Const),
         Val::I32(memory_base),
     )?;
 
+    // Table Base is ALWAYS 0 now
     let table_base_global = Global::new(
         &mut *store,
         GlobalType::new(ValType::I32, Mutability::Const),
@@ -120,20 +148,21 @@ pub fn instantiate_plugin(
         Val::I32(stack_base),
     )?;
 
-    // 3. CLONE THE LINKER (The Fix)
-    // We create a fresh linker for this specific instance.
-    // It inherits 'call', 'memory', 'host_alloc' from base_linker.
+    // 4. Clone Linker
     let mut instance_linker = base_linker.clone();
 
-    // 4. Define instance-specific globals in the FRESH linker
+    // 5. Define Imports
     instance_linker.define(&store, "env", "__memory_base", memory_base_global)?;
     instance_linker.define(&store, "env", "__table_base", table_base_global)?;
     instance_linker.define(&store, "env", "__stack_pointer", stack_pointer_global)?;
+    
+    // [FIX] Define the PRIVATE table as the import
+    instance_linker.define(&store, "env", "__indirect_function_table", local_table)?;
 
-    // 5. Instantiate using the FRESH linker
+    // 6. Instantiate
     let instance = instance_linker.instantiate(&mut *store, module)?;
 
-    // 6. Initialize Pointers
+    // 7. Initialize
     if let Some(func) = instance.get_func(&mut *store, "__wasm_call_ctors") {
         let typed = func.typed::<(), ()>(&mut *store)?;
         typed.call(&mut *store, ())?;
@@ -158,28 +187,22 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
     let host_state = HostState {
         instances: HashMap::new(),
         shared_memory: memory.clone(),
-        table: None,
+        // table: None, // Removed
         next_memory_offset: 1024 * 1024,
         next_stack_offset: 65536,
-        next_table_offset: 0,
+        // next_table_offset: 0, // Removed
         heap_allocator: Arc::new(Mutex::new(SystemAllocator(allocator))),
     };
 
     let mut store = Store::new(&engine, host_state);
     
-    let table = Table::new(
-        &mut store,
-        TableType::new(RefType::FUNCREF, 100, None),
-        Ref::Func(None), 
-    )?;
-    store.data_mut().table = Some(table);
-
-    // --- BASE LINKER SETUP ---
-    // We define ONLY the common stuff here.
+    // --- BASE LINKER ---
     let mut linker = Linker::new(&engine);
+    linker.allow_shadowing(true);
     
-    linker.allow_shadowing(true); // Still good practice
-    linker.define(&store, "env", "__indirect_function_table", table)?;
+    // Note: We do NOT define __indirect_function_table here anymore.
+    // It is defined inside instantiate_plugin per instance.
+
     linker.define(&store, "env", "memory", memory.clone())?;
     linker.func_wrap("env", "call", call)?;
     linker.func_wrap("env", "host_print", host_print)?;
@@ -189,7 +212,6 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
     let module_core = Module::from_file(&engine, "plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm")?;
     let module_client = Module::from_file(&engine, "plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm")?;
 
-    // Pass the BASE linker. The function will clone it.
     let instance_core = instantiate_plugin(&linker, &mut store, &module_core, "Core")?;
     let instance_client = instantiate_plugin(&linker, &mut store, &module_client, "Client")?;
 
