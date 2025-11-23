@@ -1,10 +1,30 @@
 // Added `anyhow` imports
 use anyhow::{Result, anyhow};
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use wasmtime::*;
 
 pub struct HostState {
     pub instances: HashMap<String, Instance>,
+}
+
+pub fn host_print(
+    mut caller: Caller<'_, HostState>,
+    message_ptr: i32,
+    message_len: i32,
+) -> Result<()> {
+    let mem = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
+
+    let mem_data = mem.data(&mut caller);
+    let message_bytes = &mem_data[message_ptr as usize..(message_ptr + message_len) as usize];
+
+    let message = String::from_utf8_lossy(message_bytes);
+    println!("{}", message);
+
+    Ok(())
 }
 
 pub fn call(
@@ -15,17 +35,16 @@ pub fn call(
     func_name_len: i32,
     payload_ptr: i32,
     payload_len: i32,
-    result_ptr: i32, // <-- FIX 1: Add the 7th parameter (the result pointer)
-) -> Result<()> {
-    // <-- FIX 2: Change return type to void
+) -> Result<i64> {
+    // ← Returns i64 (packed i32, i32)
 
-    // --- (This part is the same as before) ---
+    // Read from shared memory
     let mem = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
 
-    let mem_data = mem.data(&caller);
+    let mem_data = mem.data(&mut caller);
 
     let instance_id_bytes =
         &mem_data[instance_id_ptr as usize..(instance_id_ptr + instance_id_len) as usize];
@@ -53,32 +72,15 @@ pub fn call(
             )
         })?;
 
+    // FIX: Use the correct signature - (i32, i32) -> i64
     let typed = func
-        .typed::<(i32, i32), (i32, i32)>(&caller)
+        .typed::<(i32, i32), i64>(&caller) // ✅ Matches your core module
         .map_err(|_| anyhow!("function '{}' has incorrect signature", func_name))?;
 
-    // --- (This part changes) ---
+    // Call the function - it returns i64 directly
+    let packed_result = typed.call(&mut caller, (payload_ptr, payload_len))?;
 
-    // FIX 3: Call the function and get the (i32, i32) result
-    let (ret_ptr, ret_len) = typed.call(&mut caller, (payload_ptr, payload_len))?;
-
-    // FIX 4: Write the two i32 results back to Wasm memory at the pointer
-    // We need to re-get 'mem' as a mutable memory object to write
-    let mem = caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-        .ok_or_else(|| anyhow!("'memory' export not found or not a memory"))?;
-
-    // `(i32, i32)` is 8 bytes. Write the first i32, then the second.
-    // We write in Little Endian (LE) bytes, which is standard for Wasm.
-    mem.write(&mut caller, result_ptr as usize, &ret_ptr.to_le_bytes())?;
-    mem.write(
-        &mut caller,
-        (result_ptr + 4) as usize,
-        &ret_len.to_le_bytes(),
-    )?;
-
-    Ok(())
+    Ok(packed_result)
 }
 
 pub fn send_to_server(
@@ -148,9 +150,15 @@ pub fn fire_and_forget(
     Ok(())
 }
 
-// Changed: Return type is now anyhow::Result for consistency
 pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
-    let engine = Engine::default();
+    // 1. Configure the Engine to enable the WebAssembly Threads proposal
+    let mut config = Config::new();
+    config.wasm_threads(true); // REQUIRED for SharedMemory support
+
+    // 2. Create the Engine using the configured Config
+    let engine = Engine::new(&config)?;
+
+    // 3. Create the Store using the configured Engine
     let mut store = Store::new(
         &engine,
         HostState {
@@ -158,9 +166,12 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
         },
     );
 
-    // Create shared memory
-    let memory_type = MemoryType::new(17, None);
-    let shared_memory = Memory::new(&mut store, memory_type)?;
+    // 4. Create shared memory
+    // MemoryType::shared takes two u32 values (min pages, max pages). No Option required.
+    let memory_type = MemoryType::shared(17, 20);
+
+    // SharedMemory::new requires a reference to the Engine, not the Store.
+    let memory = SharedMemory::new(&engine, memory_type)?;
 
     // Load and link tasksapp_core
     let module_core = Module::from_file(
@@ -168,10 +179,12 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
         "plugins/tasksapp-core/target/wasm32-unknown-unknown/release/tasksapp_core.wasm",
     )?;
     let mut linker_core = Linker::new(&engine);
-    linker_core.define(&store, "env", "memory", shared_memory)?;
+    // Note: Linker::define requires a mutable store reference if linking non-function items like memory
+    linker_core.define(&mut store, "env", "memory", memory.clone())?;
     linker_core.func_wrap("env", "call", call)?;
     linker_core.func_wrap("env", "send_to_server", send_to_server)?;
     linker_core.func_wrap("env", "fire_and_forget", fire_and_forget)?;
+    linker_core.func_wrap("env", "host_print", host_print)?;
     let instance_core = linker_core.instantiate(&mut store, &module_core)?;
 
     // Load and link tasksapp_client with SAME memory
@@ -180,10 +193,12 @@ pub fn setup_runtime() -> Result<(Store<HostState>, Instance, Instance)> {
         "plugins/tasksapp-client/target/wasm32-unknown-unknown/release/tasksapp_client.wasm",
     )?;
     let mut linker_client = Linker::new(&engine);
-    linker_client.define(&store, "env", "memory", shared_memory)?;
+    // Link the SAME shared memory instance, using a clone
+    linker_client.define(&mut store, "env", "memory", memory.clone())?;
     linker_client.func_wrap("env", "call", call)?;
     linker_client.func_wrap("env", "send_to_server", send_to_server)?;
     linker_client.func_wrap("env", "fire_and_forget", fire_and_forget)?;
+    linker_client.func_wrap("env", "host_print", host_print)?;
     let instance_client = linker_client.instantiate(&mut store, &module_client)?;
 
     // Register instances
