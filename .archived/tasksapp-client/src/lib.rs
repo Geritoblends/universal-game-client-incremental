@@ -1,5 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout};
-use tasksapp_net::{NewTaskRequest, NewTaskResult};
+use tasksapp_net::{NewTaskRequest, NewTaskResult, DeleteByIdResult};
 
 // ============================================================================
 //  THE SYSTEM ALLOCATOR (The Magic Fix)
@@ -142,4 +142,30 @@ pub fn create_task(title_ptr: i32, title_len: i32, priority: i32) -> i64 {
 pub fn list_pending_tasks() -> i64 {
     let (result_ptr, result_len) = call_core("show_pending_tasks", &[]);
     pack_i64(result_ptr, result_len)
+}
+
+#[unsafe(no_mangle)]
+pub fn call_delete_task_by_id(id: i32) -> i64 {
+    print(&format!("Deleting task with id: {}", id));
+
+    let payload = id.to_le_bytes();
+    let (result_ptr, result_len) = call_core("delete_task_by_id", &payload);
+
+    // 4. Read result
+    let result_bytes =
+        unsafe { std::slice::from_raw_parts(result_ptr as *const u8, result_len as usize) };
+
+    let result: DeleteByIdResult = bincode::deserialize(result_bytes).expect("error deserializing");
+
+    let debug: String = format!("{:?}", result);
+    print(&debug);
+
+    // 6. Return response
+    let response = bincode::serialize(&result).unwrap();
+    let ptr = response.as_ptr() as i32;
+    let len = response.len() as i32;
+    std::mem::forget(response); // Leak it to the host
+                                // 
+
+    pack_i64(ptr, len)
 }

@@ -31,3 +31,9 @@ pub enum QueryByIdResult {
     Success(Task),
     NotFoundError,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DeleteByIdResult {
+    Success(i32),
+    NotFoundError,
+}

@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::alloc::{GlobalAlloc, Layout};
-use tasksapp_net::{NewTaskError, NewTaskRequest, NewTaskResult, QueryByIdResult, Task};
+use tasksapp_net::{NewTaskError, NewTaskRequest, NewTaskResult, QueryByIdResult, Task, DeleteByIdResult};
 
 // --- ALLOCATOR ---
 unsafe extern "C" {
@@ -170,3 +170,30 @@ pub fn query_by_id(task_id: i32, _unused: i32) -> i64 {
 
     pack(ptr, len)
 }
+
+#[unsafe(no_mangle)]
+pub fn delete_task_by_id(task_id_ptr: i32, _unused: i32) -> i64 {
+    let mut db = DB.lock().unwrap();
+
+    let task_id = unsafe {
+        let slice = std::slice::from_raw_parts(task_id_ptr as *const u8, 4);
+        i32::from_le_bytes(slice.try_into().unwrap())
+    };
+        
+
+    let result = match db.remove(&task_id) {
+        Some(task) => DeleteByIdResult::Success(task.id),
+        None => DeleteByIdResult::NotFoundError,
+    };
+
+    let serialized = bincode::serialize(&result).unwrap();
+    let ptr = serialized.as_ptr() as i32;
+    let len = serialized.len() as i32;
+    std::mem::forget(serialized);
+
+    pack(ptr, len)
+}
+
+
+
+

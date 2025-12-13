@@ -1,0 +1,8 @@
+[package]
+name = "tasksapp_ecs_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# It needs the allocator to set the global allocator for the user
+tasksapp_allocator = { path = "../allocator" }
