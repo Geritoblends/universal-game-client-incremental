@@ -9,3 +9,4 @@ anyhow = "1.0"
 # We need this for the safe shared-heap management
 buddy-alloc = "0.4" 
 libc = "0.2" # Often needed for raw pointer casts
+wasmparser = "0.243.0"

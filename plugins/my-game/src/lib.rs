@@ -1,66 +1,68 @@
-// plugins/my-game/src/lib.rs
-use tasksapp_ecs_client::{
-    add_component, print, register_component, register_system, spawn_entity, Component, Query,
-};
+use tasksapp_ecs_client::*;
 
 // --- 1. Define Components ---
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-struct Position {
-    x: f32,
-    y: f32,
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
 }
+
+// We must implement the Component trait from your client
 impl Component for Position {
     const ID: i32 = 1;
 }
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-struct Velocity {
-    x: f32,
-    y: f32,
+pub struct Velocity {
+    pub dx: f32,
+    pub dy: f32,
 }
+
 impl Component for Velocity {
     const ID: i32 = 2;
 }
 
-// --- 2. The Logic ---
-fn physics_logic((pos, vel): (&mut Position, &Velocity)) {
-    pos.x += vel.x;
-    pos.y += vel.y;
+// --- 2. Define System ---
 
-    // let msg = format!("Entity moved to: {:.1}, {:.1}", pos.x, pos.y);
-    // print(&msg);
-}
-
-// --- 3. The Wrapper ---
-extern "C" fn physics_system_wrapper(_world_ptr: i32) {
-    // We ignore _world_ptr for now because we use global imports
+// The function signature matches 'extern "C" fn(i32)'
+extern "C" fn sys_movement(_: i32) {
+    // Create the query. Internally, this calls ffi::query_archetypes
     let query = Query::<(&mut Position, &Velocity)>::new();
-    query.for_each(|item| {
-        physics_logic(item);
+
+    query.for_each(|(pos, vel)| {
+        pos.x += vel.dx;
+        pos.y += vel.dy;
+
+        // Since ecs_client sets up the GlobalAllocator, we can use format!
+        let msg = format!("🏃 [GAME] Entity moved to: ({:.2}, {:.2})", pos.x, pos.y);
+        print(&msg);
     });
 }
 
-// --- 4. Init & Setup ---
+// --- 3. Initialize ---
+
 #[no_mangle]
 pub extern "C" fn init() {
+    print("🎮 [GAME] Initializing...");
+
+    // A. Register Components
     register_component::<Position>();
     register_component::<Velocity>();
 
-    register_system::<(&mut Position, &Velocity)>("Physics", physics_system_wrapper);
+    // B. Register System
+    // We pass the function pointer directly.
+    // Note: The generic <(...)> is just for type safety/metadata in your API.
+    register_system::<(&mut Position, &Velocity)>("MovementSystem", sys_movement);
 
-    // Spawn 3 entities for testing
-    unsafe {
-        for _ in 0..3 {
-            let entity = spawn_entity();
+    // C. Spawn Entity
+    let e = spawn_entity();
 
-            let pos = Position { x: 10.0, y: 10.0 };
-            let vel = Velocity { x: 1.0, y: 0.0 };
+    // D. Add Components
+    add_component(e, &Position { x: 0.0, y: 0.0 });
+    add_component(e, &Velocity { dx: 1.5, dy: 0.5 });
 
-            // FIX: Use the safe API! No raw pointers needed.
-            add_component(entity, &pos);
-            add_component(entity, &vel);
-        }
-    }
+    print("✨ [GAME] Entity spawned.");
 }

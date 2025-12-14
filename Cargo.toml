@@ -1,9 +1,13 @@
-[package]
-name = "host"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "host",
+    "plugins/ecs-core",
+    "plugins/my-game"
+]
+resolver = "2"
 
-[dependencies]
-wasmtime = "39.0.0"
-anyhow = "1.0"
-buddy-alloc = "0.4"
+# --- OPTIMIZATION PROFILE ---
+# This applies to both the Host and the WASM plugins when you run with --release
+[profile.release]
+panic = "abort"        # Removes stack unwinding bloat (Critical for small WASM)
+opt-level = 3          # Maximize Runtime Speed (Use "s" if you prefer smaller size)
