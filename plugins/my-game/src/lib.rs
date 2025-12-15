@@ -28,7 +28,8 @@ impl Component for Velocity {
 // --- 2. Define System ---
 
 // The function signature matches 'extern "C" fn(i32)'
-extern "C" fn sys_movement(_: i32) {
+#[no_mangle]
+pub extern "C" fn MovementSystem(_: i32) {
     // Create the query. Internally, this calls ffi::query_archetypes
     let query = Query::<(&mut Position, &Velocity)>::new();
 
@@ -55,7 +56,7 @@ pub extern "C" fn init() {
     // B. Register System
     // We pass the function pointer directly.
     // Note: The generic <(...)> is just for type safety/metadata in your API.
-    register_system::<(&mut Position, &Velocity)>("MovementSystem", sys_movement);
+    register_system::<(&mut Position, &Velocity)>("Game", "MovementSystem", MovementSystem);
 
     // C. Spawn Entity
     let e = spawn_entity();

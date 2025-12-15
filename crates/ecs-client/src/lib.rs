@@ -15,17 +15,7 @@ mod ffi {
         pub fn get_table_column(table_idx: i32, comp_id: i32) -> i64;
         pub fn spawn_entity() -> i32;
         pub fn add_component(entity_id: i32, comp_id: i32, data_ptr: i32);
-
-        // HOST LINKER (The bridge)
-        pub fn host_link_call(
-            target_mod_ptr: i32,
-            target_mod_len: i32,
-            target_func_ptr: i32,
-            target_func_len: i32,
-            local_fn_idx: i32,
-            payload_ptr: i32,
-            payload_len: i32,
-        );
+        pub fn register_system(mod_ptr: i32, mod_len: i32, fn_ptr: i32, fn_len: i32);
     }
 }
 
@@ -78,19 +68,18 @@ pub fn register_component<T: Component>() {
     }
 }
 
-pub fn register_system<Q: WorldQuery>(name: &str, sys_fn: extern "C" fn(i32)) {
-    let target_mod = "Core";
-    let target_hook = "_link_system"; // Maps to the Core function above
-
+pub fn register_system<Q: WorldQuery>(
+    module_name: &str,
+    system_name: &str,
+    _sys_fn: extern "C" fn(i32), // Kept to prevent dead-code stripping
+) {
     unsafe {
-        ffi::host_link_call(
-            target_mod.as_ptr() as i32,
-            target_mod.len() as i32,
-            target_hook.as_ptr() as i32,
-            target_hook.len() as i32,
-            sys_fn as usize as i32,
-            name.as_ptr() as i32,
-            name.len() as i32,
+        // We speak directly to Core now
+        ffi::register_system(
+            module_name.as_ptr() as i32,
+            module_name.len() as i32,
+            system_name.as_ptr() as i32,
+            system_name.len() as i32,
         );
     }
 }

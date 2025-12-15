@@ -5,10 +5,12 @@ use std::panic;
 use std::sync::{Arc, Mutex};
 
 // --- HOST IMPORTS ---
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn host_alloc(size: i32) -> i32;
     fn host_dealloc(ptr: i32, size: i32);
     fn host_print(ptr: i32, len: i32);
+    fn host_link_call(m_ptr: *const u8, m_len: usize, f_ptr: *const u8, f_len: usize) -> i32;
 }
 
 // --- ALLOCATOR ---
@@ -160,21 +162,18 @@ pub extern "C" fn register_component(id: i32, size: i32, _align: i32) {
     world.component_strides.insert(id, size as usize);
 }
 
-// [IMPORTANT] This replaces your `register_system`.
-// It is designed to be called by the HOST (The Linker).
 #[no_mangle]
-pub extern "C" fn _link_system(
-    fn_idx: i32,   // The Index in Core's Table (Patched by Host)
-    data_ptr: i32, // System Name Ptr
-    data_len: i32,
+pub extern "C" fn register_system(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    fn_ptr: *const u8,
+    fn_len: usize,
 ) {
-    let name = unsafe {
-        String::from_utf8_lossy(std::slice::from_raw_parts(
-            data_ptr as *const u8,
-            data_len as usize,
-        ))
-        .to_string()
-    };
+    let fn_idx = unsafe { host_link_call(mod_ptr, mod_len, fn_ptr, fn_len) };
+
+    // 2. Read the System Name for our Hash Map
+    let name =
+        unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(fn_ptr, fn_len)).to_string() };
 
     // We trust the Host put the correct function at this index in OUR table.
     let func: SystemFn = unsafe { std::mem::transmute(fn_idx as usize) };

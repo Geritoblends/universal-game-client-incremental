@@ -1,67 +1,17 @@
+pub mod allocator;
+use allocator::*;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use wasmtime::*;
+use wasmtime::{
+    Caller, Config, Engine, Extern, Func, Global, GlobalType, Instance, Linker, MemoryType, Module,
+    Mutability, Ref, RefType, SharedMemory, Store, Table, TableType, Val, ValType,
+};
 
 // --- CONFIGURATION ---
 const WASM_PAGE_SIZE: u64 = 65536;
 const GROWTH_CHUNK_SIZE: u64 = 80;
 const HEAP_START_ADDR: u32 = 10 * 1024 * 1024;
-
-// --- HEAP ALLOCATOR ---
-#[derive(Debug, Clone, Copy)]
-struct FreeBlock {
-    addr: u32,
-    size: u32,
-}
-
-pub struct HostHeap {
-    free_blocks: Vec<FreeBlock>,
-}
-impl HostHeap {
-    fn new() -> Self {
-        Self {
-            free_blocks: Vec::new(),
-        }
-    }
-    fn coalesce(&mut self) {
-        if self.free_blocks.is_empty() {
-            return;
-        }
-        self.free_blocks.sort_by_key(|b| b.addr);
-        let mut i = 0;
-        while i < self.free_blocks.len() - 1 {
-            let current = self.free_blocks[i];
-            let next = self.free_blocks[i + 1];
-            if current.addr + current.size == next.addr {
-                self.free_blocks[i].size += next.size;
-                self.free_blocks.remove(i + 1);
-            } else {
-                i += 1;
-            }
-        }
-    }
-    fn alloc(&mut self, size: u32) -> Option<u32> {
-        if let Some(pos) = self.free_blocks.iter().position(|b| b.size >= size) {
-            let block = self.free_blocks[pos];
-            if block.size == size {
-                self.free_blocks.remove(pos);
-                Some(block.addr)
-            } else {
-                let ret_addr = block.addr;
-                self.free_blocks[pos].addr += size;
-                self.free_blocks[pos].size -= size;
-                Some(ret_addr)
-            }
-        } else {
-            None
-        }
-    }
-    fn dealloc(&mut self, ptr: u32, size: u32) {
-        self.free_blocks.push(FreeBlock { addr: ptr, size });
-        self.coalesce();
-    }
-}
 
 // --- HOST STATE ---
 #[derive(Clone)]
@@ -106,84 +56,6 @@ impl BlindHost {
         linker.func_wrap("env", "host_alloc", host_alloc)?;
         linker.func_wrap("env", "host_dealloc", host_dealloc)?;
 
-        // --- HOST LINK CALL ---
-        linker.func_wrap(
-            "env",
-            "host_link_call",
-            |mut c: Caller<'_, HostState>,
-             tm_p: i32,
-             tm_l: i32,
-             tf_p: i32,
-             tf_l: i32,
-             local_fn_idx: i32,
-             p_p: i32,
-             p_l: i32|
-             -> Result<()> {
-                let (target_mod, target_func) = {
-                    let mem = c.data().shared_memory.data();
-                    let base = mem.as_ptr() as *const u8;
-                    unsafe {
-                        (
-                            String::from_utf8_lossy(std::slice::from_raw_parts(
-                                base.add(tm_p as usize),
-                                tm_l as usize,
-                            ))
-                            .to_string(),
-                            String::from_utf8_lossy(std::slice::from_raw_parts(
-                                base.add(tf_p as usize),
-                                tf_l as usize,
-                            ))
-                            .to_string(),
-                        )
-                    }
-                };
-
-                let caller_table = c
-                    .data()
-                    .tables
-                    .get("Game")
-                    .ok_or(anyhow!("Caller table 'Game' not found"))?
-                    .clone();
-
-                let func = *caller_table
-                    .get(&mut c, local_fn_idx as u32)
-                    .ok_or(anyhow!("Index {} OOB in Game table", local_fn_idx))?
-                    .unwrap_func()
-                    .ok_or(anyhow!("Function is null"))?;
-
-                let core_table = c
-                    .data()
-                    .tables
-                    .get(&target_mod)
-                    .ok_or(anyhow!("Target table '{}' not found", target_mod))?
-                    .clone();
-
-                let new_idx = core_table.size(&mut c);
-                core_table.grow(&mut c, 1, Ref::Func(Some(func)))?;
-
-                println!(
-                    "🔗 [HOST] Injected Game::Fn({}) -> {}::Table[{}]",
-                    local_fn_idx, target_mod, new_idx
-                );
-
-                let core_instance = c
-                    .data()
-                    .instances
-                    .get(&target_mod)
-                    .ok_or(anyhow!("Target instance '{}' not found", target_mod))?
-                    .clone();
-
-                let hook = core_instance
-                    .get_func(&mut c, &target_func)
-                    .ok_or(anyhow!("Hook '{}' not found", target_func))?;
-
-                let params = vec![Val::I32(new_idx as i32), Val::I32(p_p), Val::I32(p_l)];
-                hook.call(&mut c, &params, &mut [])?;
-
-                Ok(())
-            },
-        )?;
-
         Ok(Self {
             engine,
             store,
@@ -199,36 +71,37 @@ impl BlindHost {
 
         let instance = instance_linker.instantiate(&mut self.store, &module)?;
 
-        // --- AUTO-EXPORT FIX ---
-        // Iterate over everything this module exports (e.g., Core exports `query_archetypes`)
-        // and register it in the MAIN linker under "env".
-        // This allows subsequent modules (Game) to find it.
+        // --- 1. REGISTER INSTANCE IMMEDIATELY ---
+        // We must do this NOW so that when `init` runs, the Host knows who "Game" is.
+        self.store
+            .data_mut()
+            .instances
+            .insert(name.to_string(), instance.clone());
+
+        // --- 2. AUTO-EXPORT FIX (unchanged) ---
         let exports: Vec<(String, Extern)> = instance
             .exports(&mut self.store)
             .map(|e| (e.name().to_string(), e.into_extern()))
             .collect();
 
         for (export_name, export_val) in exports {
-            // We define it in `self.linker` so the NEXT call to `prepare_env` picks it up.
-            // We ignore errors (like re-defining "memory" or "init") silently.
             let _ = self
                 .linker
                 .define(&self.store, "env", &export_name, export_val);
         }
 
+        // --- 3. RUN CONSTRUCTORS & INIT ---
         if let Some(func) = instance.get_func(&mut self.store, "__wasm_call_ctors") {
             func.typed::<(), ()>(&mut self.store)?
                 .call(&mut self.store, ())?;
         }
+
+        // When this runs now, `host_link_call` will successfully find "Game" in the map!
         if let Some(func) = instance.get_func(&mut self.store, "init") {
             func.typed::<(), ()>(&mut self.store)?
                 .call(&mut self.store, ())?;
         }
 
-        self.store
-            .data_mut()
-            .instances
-            .insert(name.to_string(), instance.clone());
         Ok(instance)
     }
 
@@ -239,7 +112,6 @@ impl BlindHost {
         self.store.data_mut().next_memory_offset += 512 * 1024;
         self.store.data_mut().next_stack_offset += 128 * 1024;
 
-        // Clone the MAIN linker (which now contains exports from previous modules!)
         let mut linker = self.linker.clone();
 
         let table = Table::new(
@@ -270,6 +142,83 @@ impl BlindHost {
         linker.define(&self.store, "env", "__memory_base", g_mem)?;
         linker.define(&self.store, "env", "__stack_pointer", g_stk)?;
         linker.define(&self.store, "env", "__table_base", g_tbl_base)?;
+
+        // --- ✅ CONTEXT-AWARE HOST LINK CALL ---
+        // Inside prepare_env(name: &str) ...
+
+        let caller_name = name.to_string(); // e.g., "Core"
+
+        linker.func_wrap(
+            "env",
+            "host_link_call",
+            move |mut c: Caller<'_, HostState>,
+                  provider_mod_ptr: i32,
+                  provider_mod_len: i32,
+                  provider_fn_ptr: i32,
+                  provider_fn_len: i32|
+                  -> Result<i32> {
+                // Returns Index!
+
+                // 1. Read the String arguments from Shared Memory
+                // (Since memory is shared, Core provided pointers to strings written by Game)
+                let (provider_mod, provider_func) = {
+                    let mem = c.data().shared_memory.data();
+                    let base = mem.as_ptr() as *const u8;
+                    unsafe {
+                        (
+                            String::from_utf8_lossy(std::slice::from_raw_parts(
+                                base.add(provider_mod_ptr as usize),
+                                provider_mod_len as usize,
+                            ))
+                            .to_string(),
+                            String::from_utf8_lossy(std::slice::from_raw_parts(
+                                base.add(provider_fn_ptr as usize),
+                                provider_fn_len as usize,
+                            ))
+                            .to_string(),
+                        )
+                    }
+                };
+
+                // 2. Find the Provider's Instance (e.g., "Game")
+                println!("Available instances: {:?}", c.data().instances.keys());
+                let provider_instance = c
+                    .data()
+                    .instances
+                    .get(&provider_mod)
+                    .ok_or(anyhow!("Provider module '{}' not loaded", provider_mod))?
+                    .clone();
+
+                // 3. Get the Function (using the Named Export!)
+                let func = provider_instance
+                    .get_func(&mut c, &provider_func)
+                    .ok_or(anyhow!(
+                        "Export '{}' not found in '{}'",
+                        provider_func,
+                        provider_mod
+                    ))?;
+
+                // 4. Get the Caller's Table (e.g., "Core")
+                // We inject the function into the person who asked for it.
+                let caller_table = c
+                    .data()
+                    .tables
+                    .get(&caller_name)
+                    .ok_or(anyhow!("Caller table '{}' not found", caller_name))?
+                    .clone();
+
+                // 5. Inject and return Index
+                let new_idx = caller_table.size(&mut c);
+                caller_table.grow(&mut c, 1, Ref::Func(Some(func)))?;
+
+                println!(
+                    "🔗 [HOST] Linked {}::{} into {}::Table[{}]",
+                    provider_mod, provider_func, caller_name, new_idx
+                );
+
+                Ok(new_idx as i32)
+            },
+        )?;
 
         Ok(linker)
     }
