@@ -1,5 +1,5 @@
 use anyhow::Result;
-use host::BlindHost;
+use host::host::host_object::BlindHost;
 
 fn main() -> Result<()> {
     let mut host = BlindHost::new()?;
