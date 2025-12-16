@@ -28,6 +28,7 @@ unsafe impl GlobalAlloc for HostAllocator {
         host_dealloc(ptr as i32, layout.size() as i32);
     }
 }
+
 #[global_allocator]
 static ALLOCATOR: HostAllocator = HostAllocator;
 
@@ -178,7 +179,10 @@ pub extern "C" fn register_system(
     // We trust the Host put the correct function at this index in OUR table.
     let func: SystemFn = unsafe { std::mem::transmute(fn_idx as usize) };
 
-    println!("[Core] Linked system '{}' (Table Index: {})", name, fn_idx);
+    print(&format!(
+        "[Core] Linked system '{}' (Table Index: {})",
+        name, fn_idx
+    ));
 
     let mut world = WORLD.lock().unwrap();
     world.systems.insert(

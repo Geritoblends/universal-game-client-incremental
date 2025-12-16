@@ -3,7 +3,7 @@ use wasmtime::Caller;
 
 const WASM_PAGE_SIZE: u64 = 65536;
 const GROWTH_CHUNK_SIZE: u64 = 80;
-const HEAP_START_ADDR: u32 = 10 * 1024 * 1024;
+const HEAP_START_ADDR: u32 = 32 * 1024 * 1024;
 
 pub fn host_alloc(caller: Caller<'_, HostState>, size: i32) -> i32 {
     let size = (size as u32 + 7) & !7;

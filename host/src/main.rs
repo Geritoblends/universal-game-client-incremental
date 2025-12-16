@@ -1,8 +1,9 @@
 use anyhow::Result;
-use host::host::host_object::BlindHost;
+use host::host::host_object::{BlindHost, BlindHostConfig};
 
 fn main() -> Result<()> {
-    let mut host = BlindHost::new()?;
+    let config = BlindHostConfig::default();
+    let mut host = BlindHost::new(config)?;
 
     // --- 1. Load Modules (Release Mode) ---
     // Using "../target/wasm32-unknown-unknown/release/" based on your output

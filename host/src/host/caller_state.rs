@@ -11,4 +11,7 @@ pub struct HostState {
     pub next_memory_offset: i32,
     pub next_stack_offset: i32,
     pub heap: Arc<Mutex<HostHeap>>,
+    pub slot_size: i32,
+    pub data_size: i32,
+    pub heap_start_address: i32,
 }

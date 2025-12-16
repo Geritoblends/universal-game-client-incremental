@@ -10,6 +10,33 @@ use wasmtime::{
     Mutability, Ref, RefType, SharedMemory, Store, Table, TableType, Val, ValType,
 };
 
+const DATA_REGION_START: i32 = 1024;
+const STACK_REGION_START: i32 = 16 * 1024 * 1024;
+const MODULE_DATA_ALLOWANCE: i32 = 1 * 1024 * 1024;
+const MODULE_STACK_SIZE: i32 = 1 * 1024 * 1024;
+
+pub struct BlindHostConfig {
+    pub max_plugins: u32,
+    pub data_allowance: i32,
+    pub stack_size: i32,
+}
+
+impl BlindHostConfig {
+    pub fn default() -> Self {
+        Self {
+            max_plugins: 16,
+            data_allowance: 128 * 1024,
+            stack_size: 1 * 1024 * 1024,
+        }
+    }
+
+    pub fn slot_size(&self) -> i32 {
+        let size = self.data_allowance + self.stack_size + 16;
+
+        (size + 4095) & !4095
+    }
+}
+
 pub struct BlindHost {
     pub engine: Engine,
     pub store: Store<HostState>,
@@ -17,19 +44,57 @@ pub struct BlindHost {
 }
 
 impl BlindHost {
-    pub fn new() -> Result<Self> {
-        let mut config = Config::new();
-        config.wasm_threads(true);
-        let engine = Engine::new(&config)?;
+    pub fn new(config: BlindHostConfig) -> Result<Self> {
+        let mut wasm_config = Config::new();
+        wasm_config.wasm_threads(true);
+        let engine = Engine::new(&wasm_config)?;
 
-        let memory = SharedMemory::new(&engine, MemoryType::shared(1000, 16384))?;
+        // --- 1. EXACT CALCULATION ---
+        let slot_size = config.slot_size();
+        let total_reserved_bytes = 1024 + (slot_size * (config.max_plugins as i32));
 
+        // Align Heap Start to next 64KB Page (standard Wasm page alignment)
+        let heap_start_address = (total_reserved_bytes + 65535) & !65535;
+
+        // Convert our requirement to Wasm Pages (64KB each)
+        let needed_pages = heap_start_address / 65536;
+
+        // --- 2. THE SAFETY BUFFER ---
+        // Rust's memory allocator (dlmalloc/wee_alloc) grabs a chunk of memory
+        // immediately on startup to manage the heap.
+        // 32 Pages = 2 MB. This is plenty for overhead but small enough to be efficient.
+        let safety_buffer_pages = 256;
+
+        let initial_pages = needed_pages + safety_buffer_pages;
+
+        println!("⚙️ [HOST] Memory Optimization:");
+        println!(
+            "   ├── Reserved for Slots: {:.2} MB ({} Pages)",
+            needed_pages as f32 * 64.0 / 1024.0,
+            needed_pages
+        );
+        println!(
+            "   ├── Runtime Buffer:     2.00 MB ({} Pages)",
+            safety_buffer_pages
+        );
+        println!(
+            "   └── Total Allocation:   {:.2} MB",
+            initial_pages as f32 * 64.0 / 1024.0
+        );
+
+        // --- 3. CREATE MEMORY ---
+        let memory = SharedMemory::new(&engine, MemoryType::shared(initial_pages as u32, 16384))?;
+
+        // --- 4. STATE SETUP (Same as before) ---
         let initial_state = HostState {
             instances: HashMap::new(),
             tables: HashMap::new(),
             shared_memory: memory.clone(),
             next_memory_offset: 1024,
-            next_stack_offset: 5 * 1024 * 1024,
+            next_stack_offset: 0,
+            slot_size,
+            heap_start_address,
+            data_size: config.data_allowance,
             heap: Arc::new(Mutex::new(HostHeap::new())),
         };
 
@@ -49,22 +114,19 @@ impl BlindHost {
         })
     }
 
+    // load_plugin remains exactly the same as your working version
     pub fn load_plugin(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<Instance> {
         println!("📦 [HOST] Loading Plugin: {}", name);
         let module = Module::new(&self.engine, wasm_bytes)?;
-
         let instance_linker = self.prepare_env(name)?;
-
         let instance = instance_linker.instantiate(&mut self.store, &module)?;
 
-        // --- 1. REGISTER INSTANCE IMMEDIATELY ---
-        // We must do this NOW so that when `init` runs, the Host knows who "Game" is.
         self.store
             .data_mut()
             .instances
             .insert(name.to_string(), instance.clone());
 
-        // --- 2. AUTO-EXPORT FIX (unchanged) ---
+        // Auto-Export
         let exports: Vec<(String, Extern)> = instance
             .exports(&mut self.store)
             .map(|e| (e.name().to_string(), e.into_extern()))
@@ -76,13 +138,11 @@ impl BlindHost {
                 .define(&self.store, "env", &export_name, export_val);
         }
 
-        // --- 3. RUN CONSTRUCTORS & INIT ---
+        // Init
         if let Some(func) = instance.get_func(&mut self.store, "__wasm_call_ctors") {
             func.typed::<(), ()>(&mut self.store)?
                 .call(&mut self.store, ())?;
         }
-
-        // When this runs now, `host_link_call` will successfully find "Game" in the map!
         if let Some(func) = instance.get_func(&mut self.store, "init") {
             func.typed::<(), ()>(&mut self.store)?
                 .call(&mut self.store, ())?;
@@ -92,47 +152,60 @@ impl BlindHost {
     }
 
     fn prepare_env(&mut self, name: &str) -> Result<Linker<HostState>> {
-        let current_mem_offset = self.store.data().next_memory_offset;
-        let stack_ptr = self.store.data().next_stack_offset;
+        let state = self.store.data();
+        let slot_base = state.next_memory_offset;
+        let slot_size = state.slot_size;
+        let heap_limit = state.heap_start_address;
 
-        self.store.data_mut().next_memory_offset += 512 * 1024;
-        self.store.data_mut().next_stack_offset += 128 * 1024;
+        // Safety Check
+        if slot_base + slot_size > heap_limit {
+            return Err(anyhow::anyhow!("❌ Out of Module Slots!"));
+        }
+
+        let my_data_start = slot_base;
+        let my_stack_top = slot_base + slot_size - 16;
+
+        // Advance Pointers
+        self.store.data_mut().next_memory_offset += slot_size;
+
+        println!("       ├── Slot Base:  {:#X}", slot_base);
+        println!("       └── Stack Top:  {:#X}", my_stack_top);
 
         let mut linker = self.linker.clone();
 
+        // 1. Table
         let table = Table::new(
             &mut self.store,
             TableType::new(RefType::FUNCREF, 1024, None),
             Ref::Func(None),
         )?;
-
         linker.define(&self.store, "env", "__indirect_function_table", table)?;
         self.store.data_mut().tables.insert(name.to_string(), table);
 
+        // 2. Globals (Created INDIVIDUALLY to satisfy Borrow Checker)
         let g_mem = Global::new(
             &mut self.store,
             GlobalType::new(ValType::I32, Mutability::Const),
-            Val::I32(current_mem_offset),
+            Val::I32(my_data_start),
         )?;
+        linker.define(&self.store, "env", "__memory_base", g_mem)?;
+
         let g_stk = Global::new(
             &mut self.store,
             GlobalType::new(ValType::I32, Mutability::Var),
-            Val::I32(stack_ptr),
+            Val::I32(my_stack_top),
         )?;
-        let g_tbl_base = Global::new(
+        linker.define(&self.store, "env", "__stack_pointer", g_stk)?;
+
+        let g_tbl = Global::new(
             &mut self.store,
             GlobalType::new(ValType::I32, Mutability::Const),
             Val::I32(0),
         )?;
+        linker.define(&self.store, "env", "__table_base", g_tbl)?;
 
-        linker.define(&self.store, "env", "__memory_base", g_mem)?;
-        linker.define(&self.store, "env", "__stack_pointer", g_stk)?;
-        linker.define(&self.store, "env", "__table_base", g_tbl_base)?;
-
-        // --- ✅ CONTEXT-AWARE HOST LINK CALL ---
-        // Inside prepare_env(name: &str) ...
-
-        let caller_name = name.to_string(); // e.g., "Core"
+        // 3. Host Link Call
+        let caller_name = name.to_string();
 
         linker.func_wrap(
             "env",
@@ -143,10 +216,9 @@ impl BlindHost {
                   provider_fn_ptr: i32,
                   provider_fn_len: i32|
                   -> Result<i32> {
-                // Returns Index!
-
-                // 1. Read the String arguments from Shared Memory
-                // (Since memory is shared, Core provided pointers to strings written by Game)
+                // --- SAFE STRING READ ---
+                // We access memory directly to replicate your working logic,
+                // but we do it safely inside the closure.
                 let (provider_mod, provider_func) = {
                     let mem = c.data().shared_memory.data();
                     let base = mem.as_ptr() as *const u8;
@@ -166,42 +238,32 @@ impl BlindHost {
                     }
                 };
 
-                // 2. Find the Provider's Instance (e.g., "Game")
-                println!("Available instances: {:?}", c.data().instances.keys());
+                // Logic to find instance and function
                 let provider_instance = c
                     .data()
                     .instances
                     .get(&provider_mod)
-                    .ok_or(anyhow!("Provider module '{}' not loaded", provider_mod))?
+                    .ok_or(anyhow::anyhow!("Provider '{}' not found", provider_mod))?
                     .clone();
 
-                // 3. Get the Function (using the Named Export!)
                 let func = provider_instance
                     .get_func(&mut c, &provider_func)
-                    .ok_or(anyhow!(
-                        "Export '{}' not found in '{}'",
-                        provider_func,
-                        provider_mod
-                    ))?;
+                    .ok_or(anyhow::anyhow!("Export '{}' not found", provider_func))?;
 
-                // 4. Get the Caller's Table (e.g., "Core")
-                // We inject the function into the person who asked for it.
                 let caller_table = c
                     .data()
                     .tables
                     .get(&caller_name)
-                    .ok_or(anyhow!("Caller table '{}' not found", caller_name))?
+                    .ok_or(anyhow::anyhow!("Table for '{}' not found", caller_name))?
                     .clone();
 
-                // 5. Inject and return Index
                 let new_idx = caller_table.size(&mut c);
                 caller_table.grow(&mut c, 1, Ref::Func(Some(func)))?;
 
                 println!(
-                    "🔗 [HOST] Linked {}::{} into {}::Table[{}]",
+                    "🔗 [HOST] Linked {}::{} -> {}::Table[{}]",
                     provider_mod, provider_func, caller_name, new_idx
                 );
-
                 Ok(new_idx as i32)
             },
         )?;
@@ -215,13 +277,10 @@ impl BlindHost {
             .data()
             .instances
             .get(module_name)
-            .ok_or(anyhow!("Instance '{}' not loaded", module_name))?
+            .ok_or(anyhow::anyhow!("Instance not found"))?
             .clone();
-
-        instance.get_func(&mut self.store, func_name).ok_or(anyhow!(
-            "Function '{}' not found in module '{}'",
-            func_name,
-            module_name
-        ))
+        instance
+            .get_func(&mut self.store, func_name)
+            .ok_or(anyhow::anyhow!("Function not found"))
     }
 }
