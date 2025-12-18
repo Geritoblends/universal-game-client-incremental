@@ -1,203 +1,306 @@
-// crates/ecs-client/src/lib.rs
 use std::alloc::{GlobalAlloc, Layout};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicI32, Ordering};
 
-// --- MEMORY SAFETY ---
-mod ffi {
-    extern "C" {
-        pub fn host_alloc(size: i32) -> i32;
-        pub fn host_dealloc(ptr: i32, size: i32);
-        pub fn host_print(ptr: i32, len: i32);
-
-        // Core Direct Exports
-        pub fn register_component(id: i32, size: i32, align: i32);
-        pub fn query_archetypes(req_ptr: i32, req_count: i32, out_ptr: i32, out_cap: i32) -> i32;
-        pub fn get_table_column(table_idx: i32, comp_id: i32) -> i64;
-        pub fn spawn_entity() -> i32;
-        pub fn add_component(entity_id: i32, comp_id: i32, data_ptr: i32);
-        pub fn register_system(mod_ptr: i32, mod_len: i32, fn_ptr: i32, fn_len: i32);
-        pub fn set_standard_id(kind: i32, id: i32);
-    }
-}
+// ============================================================================
+// 1. HOST & KERNEL BINDS
+// ============================================================================
 
 struct HostAllocator;
+extern "C" {
+    fn host_alloc(size: i32) -> i32;
+    fn host_dealloc(ptr: i32, size: i32);
+
+    // Kernel Syscalls
+    fn sys_register_component(size: i32, align: i32) -> i32;
+    fn sys_spawn_entity(count: i32, ids: *const i32, data: *const *const u8) -> i32;
+    fn sys_query_tables(ids: *const i32, len: i32, out_len: *mut i32) -> *const i32;
+    fn sys_get_table_len(table: i32) -> i32;
+    fn sys_get_column_ptr(table: i32, comp: i32) -> *mut u8;
+    fn sys_resource(id: i32, size: i32) -> *mut u8;
+}
+
 unsafe impl GlobalAlloc for HostAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = ffi::host_alloc(layout.size() as i32);
-        if ptr == 0 {
-            return std::ptr::null_mut();
-        }
-        ptr as *mut u8
+        host_alloc(layout.size() as i32) as *mut u8
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        ffi::host_dealloc(ptr as i32, layout.size() as i32);
+        host_dealloc(ptr as i32, layout.size() as i32);
     }
 }
 
 #[global_allocator]
 static ALLOCATOR: HostAllocator = HostAllocator;
 
-pub fn print(msg: &str) {
-    unsafe {
-        ffi::host_print(msg.as_ptr() as i32, msg.len() as i32);
-    }
-}
-
-// --- PUBLIC API ---
+// ============================================================================
+// 2. COMPONENTS & COMMANDS
+// ============================================================================
 
 pub trait Component: Sized + 'static {
-    const ID: i32;
-}
-
-pub fn spawn_entity() -> i32 {
-    unsafe { ffi::spawn_entity() }
-}
-
-pub fn add_component<T: Component>(entity: i32, component: &T) {
-    unsafe {
-        ffi::add_component(entity, T::ID, component as *const T as i32);
+    fn get_id() -> i32 {
+        static ID: AtomicI32 = AtomicI32::new(-1);
+        let id = ID.load(Ordering::Relaxed);
+        if id == -1 {
+            let new_id = unsafe {
+                sys_register_component(
+                    std::mem::size_of::<Self>() as i32,
+                    std::mem::align_of::<Self>() as i32,
+                )
+            };
+            ID.store(new_id, Ordering::Relaxed);
+            return new_id;
+        }
+        id
     }
 }
 
-pub trait StandardComponent: Component {
-    const KIND: i32;
+// Support tuples for spawning
+pub trait Bundle {
+    fn get_ids_and_ptrs(&self, ids: &mut Vec<i32>, ptrs: &mut Vec<*const u8>);
 }
 
-pub fn register_component<T: Component>() {
-    unsafe {
-        ffi::register_component(
-            T::ID,
-            std::mem::size_of::<T>() as i32,
-            std::mem::align_of::<T>() as i32,
-        );
+// Impl Bundle for single component
+impl<T: Component> Bundle for T {
+    fn get_ids_and_ptrs(&self, ids: &mut Vec<i32>, ptrs: &mut Vec<*const u8>) {
+        ids.push(T::get_id());
+        ptrs.push(self as *const T as *const u8);
     }
 }
 
-pub fn register_std_component<T: StandardComponent>() {
-    register_component::<T>();
-    unsafe {
-        ffi::set_standard_id(T::KIND, T::ID);
+// Impl Bundle for tuple (A, B)
+impl<A: Component, B: Component> Bundle for (A, B) {
+    fn get_ids_and_ptrs(&self, ids: &mut Vec<i32>, ptrs: &mut Vec<*const u8>) {
+        ids.push(A::get_id());
+        ptrs.push(&self.0 as *const A as *const u8);
+        ids.push(B::get_id());
+        ptrs.push(&self.1 as *const B as *const u8);
     }
 }
 
-pub fn register_system<Q: WorldQuery>(
-    module_name: &str,
-    system_name: &str,
-    _sys_fn: extern "C" fn(i32), // Kept to prevent dead-code stripping
-) {
-    unsafe {
-        // We speak directly to Core now
-        ffi::register_system(
-            module_name.as_ptr() as i32,
-            module_name.len() as i32,
-            system_name.as_ptr() as i32,
-            system_name.len() as i32,
-        );
+pub struct Commands;
+impl Commands {
+    pub fn spawn<B: Bundle>(bundle: B) {
+        let mut ids = Vec::new();
+        let mut ptrs = Vec::new();
+        bundle.get_ids_and_ptrs(&mut ids, &mut ptrs);
+
+        unsafe {
+            sys_spawn_entity(ids.len() as i32, ids.as_ptr(), ptrs.as_ptr());
+        }
     }
 }
 
-// --- QUERY SYSTEM ---
+// ============================================================================
+// 3. RESOURCES
+// ============================================================================
 
-pub struct ColumnView<T> {
+pub trait Resource: Sized + 'static {
+    // We change this to a function that CAN be overridden
+    fn resource_id() -> i32 {
+        // Default behavior: Generate a random ID (offset by 1000 to avoid conflicts with fixed IDs)
+        static ID: AtomicI32 = AtomicI32::new(-1);
+        let id = ID.load(Ordering::Relaxed);
+        if id == -1 {
+            static CTR: AtomicI32 = AtomicI32::new(1000);
+            let new_id = CTR.fetch_add(1, Ordering::Relaxed);
+            ID.store(new_id, Ordering::Relaxed);
+            return new_id;
+        }
+        id
+    }
+}
+
+// Accessors
+pub struct Res<'a, T: Resource> {
+    ptr: *const T,
+    _m: PhantomData<&'a T>,
+}
+impl<'a, T: Resource> Res<'a, T> {
+    pub fn get() -> Self {
+        unsafe {
+            let ptr = sys_resource(T::resource_id(), std::mem::size_of::<T>() as i32);
+            Self {
+                ptr: ptr as *const T,
+                _m: PhantomData,
+            }
+        }
+    }
+}
+impl<'a, T: Resource> std::ops::Deref for Res<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
+}
+
+pub struct ResMut<'a, T: Resource> {
     ptr: *mut T,
-    _len: usize,
+    _m: PhantomData<&'a mut T>,
+}
+impl<'a, T: Resource> ResMut<'a, T> {
+    pub fn get() -> Self {
+        unsafe {
+            let ptr = sys_resource(T::resource_id(), std::mem::size_of::<T>() as i32);
+            Self {
+                ptr: ptr as *mut T,
+                _m: PhantomData,
+            }
+        }
+    }
+}
+impl<'a, T: Resource> std::ops::Deref for ResMut<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
+}
+impl<'a, T: Resource> std::ops::DerefMut for ResMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.ptr }
+    }
 }
 
-pub trait WorldQuery {
-    type Item<'a>;
-    type Columns;
-    fn get_ids() -> Vec<i32>;
-    unsafe fn init_columns(table_idx: i32) -> Self::Columns;
-    unsafe fn fetch<'a>(columns: &Self::Columns, row: usize) -> Self::Item<'a>;
+#[macro_export]
+macro_rules! export_grid {
+    ($grid_type:ty) => {
+        /// The Host calls this to get the pointer.
+        #[no_mangle]
+        pub extern "C" fn get_grid_ptr() -> i32 {
+            // Force creation if it doesn't exist
+            let res = $crate::Res::<$grid_type>::get();
+            // Return raw Wasm pointer (u32 cast to i32)
+            (res.deref() as *const $grid_type) as i32
+        }
+    };
 }
 
-pub struct Query<Q: WorldQuery>(PhantomData<Q>);
+// ============================================================================
+// 4. QUERIES
+// ============================================================================
 
-impl<Q: WorldQuery> Query<Q> {
+pub struct Query<T> {
+    _m: PhantomData<T>,
+}
+
+impl<T: Component> Query<T> {
     pub fn new() -> Self {
-        Self(PhantomData)
+        Self { _m: PhantomData }
     }
 
     pub fn for_each<F>(&self, mut f: F)
     where
-        F: FnMut(Q::Item<'_>),
+        F: FnMut(&mut T),
     {
-        let ids = Q::get_ids();
-        let mut table_indices = [0i32; 64];
-        let count = unsafe {
-            ffi::query_archetypes(
-                ids.as_ptr() as i32,
-                ids.len() as i32,
-                table_indices.as_mut_ptr() as i32,
-                64,
-            )
-        };
+        unsafe {
+            let cid = T::get_id();
+            let reqs = [cid];
+            let mut count = 0;
 
-        for i in 0..count {
-            let table_idx = table_indices[i as usize];
-            unsafe {
-                let columns = Q::init_columns(table_idx);
-                // We use ID[0] to determine row count
-                let packed = ffi::get_table_column(table_idx, ids[0]);
-                let len_bytes = (packed >> 32) as usize;
-                // Note: You need a way to know the size of component ID[0] here to calc rows perfectly.
-                // For now assuming 8 bytes (f32, f32). In prod, `get_table_column` should return `rows` directly.
-                let row_count = len_bytes / 8;
+            // 1. Get Tables
+            let tables_ptr = sys_query_tables(reqs.as_ptr(), 1, &mut count);
+            let tables = std::slice::from_raw_parts(tables_ptr, count as usize);
 
-                for row in 0..row_count {
-                    f(Q::fetch(&columns, row));
+            for &tid in tables {
+                // 2. Get Data
+                let len = sys_get_table_len(tid);
+                let ptr = sys_get_column_ptr(tid, cid);
+
+                // 3. Slice & Iterate
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut T, len as usize);
+                for item in slice {
+                    f(item);
                 }
             }
         }
     }
 }
 
-// --- IMPLS ---
+// Tuple Query support (A, B)
+impl<A: Component, B: Component> Query<(A, B)> {
+    pub fn new() -> Self {
+        Self { _m: PhantomData }
+    }
 
-impl<T: Component> WorldQuery for &mut T {
-    type Item<'a> = &'a mut T;
-    type Columns = ColumnView<T>;
-    fn get_ids() -> Vec<i32> {
-        vec![T::ID]
-    }
-    unsafe fn init_columns(idx: i32) -> Self::Columns {
-        let packed = ffi::get_table_column(idx, T::ID);
-        let ptr = (packed & 0xFFFFFFFF) as *mut T;
-        ColumnView { ptr, _len: 0 }
-    }
-    unsafe fn fetch<'a>(col: &Self::Columns, row: usize) -> Self::Item<'a> {
-        &mut *col.ptr.add(row)
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut A, &mut B),
+    {
+        unsafe {
+            let id_a = A::get_id();
+            let id_b = B::get_id();
+            let reqs = [id_a, id_b];
+            let mut count = 0;
+
+            let tables_ptr = sys_query_tables(reqs.as_ptr(), 2, &mut count);
+            let tables = std::slice::from_raw_parts(tables_ptr, count as usize);
+
+            for &tid in tables {
+                let len = sys_get_table_len(tid) as usize;
+                let ptr_a = sys_get_column_ptr(tid, id_a) as *mut A;
+                let ptr_b = sys_get_column_ptr(tid, id_b) as *mut B;
+
+                let slice_a = std::slice::from_raw_parts_mut(ptr_a, len);
+                let slice_b = std::slice::from_raw_parts_mut(ptr_b, len);
+
+                for i in 0..len {
+                    f(&mut slice_a[i], &mut slice_b[i]);
+                }
+            }
+        }
     }
 }
 
-impl<T: Component> WorldQuery for &T {
-    type Item<'a> = &'a T;
-    type Columns = ColumnView<T>;
-    fn get_ids() -> Vec<i32> {
-        vec![T::ID]
+// ============================================================================
+// 5. APP ABSTRACTION
+// ============================================================================
+
+pub struct App {
+    startup: Vec<fn()>,
+    update: Vec<fn()>,
+}
+impl App {
+    pub fn new() -> Self {
+        Self {
+            startup: vec![],
+            update: vec![],
+        }
     }
-    unsafe fn init_columns(idx: i32) -> Self::Columns {
-        let packed = ffi::get_table_column(idx, T::ID);
-        let ptr = (packed & 0xFFFFFFFF) as *mut T;
-        ColumnView { ptr, _len: 0 }
-    }
-    unsafe fn fetch<'a>(col: &Self::Columns, row: usize) -> Self::Item<'a> {
-        &*col.ptr.add(row)
+    pub fn add_systems(&mut self, s: Schedule, f: fn()) {
+        match s {
+            Schedule::Startup => self.startup.push(f),
+            Schedule::Update => self.update.push(f),
+        }
     }
 }
+pub enum Schedule {
+    Startup,
+    Update,
+}
 
-impl<A: WorldQuery, B: WorldQuery> WorldQuery for (A, B) {
-    type Item<'a> = (A::Item<'a>, B::Item<'a>);
-    type Columns = (A::Columns, B::Columns);
-    fn get_ids() -> Vec<i32> {
-        let mut ids = A::get_ids();
-        ids.extend(B::get_ids());
-        ids
-    }
-    unsafe fn init_columns(idx: i32) -> Self::Columns {
-        (A::init_columns(idx), B::init_columns(idx))
-    }
-    unsafe fn fetch<'a>((a, b): &Self::Columns, row: usize) -> Self::Item<'a> {
-        (A::fetch(a, row), B::fetch(b, row))
-    }
+#[macro_export]
+macro_rules! register_plugin {
+    ($setup:ident) => {
+        static mut APP: Option<$crate::App> = None;
+        #[no_mangle]
+        pub extern "C" fn plugin_init() {
+            unsafe {
+                let mut app = $crate::App::new();
+                $setup(&mut app);
+                for s in &app.startup {
+                    s();
+                }
+                APP = Some(app);
+            }
+        }
+        #[no_mangle]
+        pub extern "C" fn plugin_update() {
+            unsafe {
+                if let Some(app) = &APP {
+                    for s in &app.update {
+                        s();
+                    }
+                }
+            }
+        }
+    };
 }

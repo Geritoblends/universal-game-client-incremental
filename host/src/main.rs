@@ -1,333 +1,399 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
 };
 use ratatui::{prelude::*, widgets::*};
 use std::fs;
 use std::io::stdout;
+use std::time::Duration;
 
 // --- MODULES ---
 pub mod allocator;
 pub mod host;
 pub mod host_calls;
 
-use ecs_protocol::{Cursor, Position, StandardIds, Tile, TileStatus};
+// Use your existing BlindHost structure
 use host::host_object::{BlindHost, BlindHostConfig};
 
-// --- HELPER FUNCTIONS ---
+// --- SHARED DATA CONTRACT ---
+// These must match the memory layout of the Wasm guest exactly.
 
-fn get_column_info(host: &mut BlindHost, table_idx: i32, comp_id: i32) -> Result<(i32, i32)> {
-    let get_col_fn = host
-        .get_func("ecs_core", "get_table_column")?
-        .typed::<(i32, i32), i64>(&mut host.store)?;
+const GRID_RES_ID: i32 = 100;
+const INPUT_RES_ID: i32 = 101;
+const MAX_WIDTH: usize = 32;
+const MAX_HEIGHT: usize = 16;
+const MAX_CELLS: usize = MAX_WIDTH * MAX_HEIGHT;
 
-    let packed = get_col_fn.call(&mut host.store, (table_idx, comp_id))?;
-    if packed == 0 {
-        return Ok((0, 0));
-    }
-
-    let len = (packed >> 32) as i32;
-    let ptr = (packed & 0xFFFFFFFF) as i32;
-    Ok((ptr, len))
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    pub is_mine: bool,
+    pub is_revealed: bool,
+    pub is_flagged: bool,
+    pub neighbors: u8,
 }
 
-fn fetch_game_data(
-    host: &mut BlindHost,
-    tile_id: i32,
-    pos_id: i32,
-    results: &mut Vec<(Position, Tile)>,
-) -> Result<()> {
-    results.clear();
-
-    // 1. Alloc & Write Query IDs
-    let query_ids = [pos_id, tile_id];
-    let query_size = 8;
-    let query_ptr = guest_alloc(host, query_size)?;
-
-    let mut query_bytes = Vec::new();
-    for id in query_ids {
-        query_bytes.extend_from_slice(&id.to_le_bytes());
-    }
-    host.write_mem(query_ptr, &query_bytes)?;
-
-    // 2. Alloc Output Buffer (for table IDs)
-    let max_tables = 10;
-    let out_ptr = guest_alloc(host, max_tables * 4)?;
-
-    // 3. Run Query
-    let query_fn = host
-        .get_func("ecs_core", "query_archetypes")?
-        .typed::<(i32, i32, i32, i32), i32>(&mut host.store)?;
-
-    let table_count = query_fn.call(&mut host.store, (query_ptr, 2, out_ptr, max_tables))?;
-
-    // 4. Read Results
-    if table_count > 0 {
-        let table_bytes = host.read_mem(out_ptr, table_count * 4)?;
-        let table_indices = unsafe {
-            std::slice::from_raw_parts(table_bytes.as_ptr() as *const i32, table_count as usize)
-        };
-
-        for &table_idx in table_indices {
-            let (pos_ptr, pos_len) = get_column_info(host, table_idx, pos_id)?;
-            let (tile_ptr, tile_len) = get_column_info(host, table_idx, tile_id)?;
-
-            if pos_len > 0 && pos_len == tile_len {
-                let p_bytes = host.read_mem(pos_ptr, pos_len * 8)?;
-                let t_bytes = host.read_mem(tile_ptr, tile_len * 2)?;
-
-                let positions: &[Position] = unsafe {
-                    std::slice::from_raw_parts(
-                        p_bytes.as_ptr() as *const Position,
-                        pos_len as usize,
-                    )
-                };
-                let tiles: &[Tile] = unsafe {
-                    std::slice::from_raw_parts(t_bytes.as_ptr() as *const Tile, tile_len as usize)
-                };
-
-                for (p, t) in positions.iter().zip(tiles.iter()) {
-                    results.push((*p, *t));
-                }
-            }
-        }
-    }
-
-    // 5. Cleanup
-    guest_dealloc(host, query_ptr, query_size);
-    guest_dealloc(host, out_ptr, max_tables * 4);
-
-    Ok(())
+#[repr(C)]
+struct GameGrid {
+    pub width: i32,
+    pub height: i32,
+    pub cursor_x: i32,
+    pub cursor_y: i32,
+    pub game_over: bool,
+    pub cells: [Cell; MAX_CELLS],
 }
 
-fn fetch_cursor(host: &mut BlindHost, cursor_id: i32) -> Result<Cursor> {
-    let mut cursor = Cursor { x: 0, y: 0 };
+#[repr(C)]
+struct InputState {
+    pub dx: i32,
+    pub dy: i32,
+    pub reveal: bool,
+    pub flag: bool,
+}
 
-    let query_ptr = guest_alloc(host, 4)?;
-    host.write_mem(query_ptr, &cursor_id.to_le_bytes())?;
+// --- APP STATE ---
 
-    let out_ptr = guest_alloc(host, 4)?;
-    let query_fn = host
-        .get_func("ecs_core", "query_archetypes")?
-        .typed::<(i32, i32, i32, i32), i32>(&mut host.store)?;
+#[derive(Clone, Copy, PartialEq)]
+enum AppScreen {
+    Menu,
+    Game,
+    Exiting,
+}
 
-    let count = query_fn.call(&mut host.store, (query_ptr, 1, out_ptr, 1))?;
-
-    if count > 0 {
-        let table_bytes = host.read_mem(out_ptr, 4)?;
-        let table_idx = i32::from_le_bytes(table_bytes[0..4].try_into()?);
-
-        let (ptr, len) = get_column_info(host, table_idx, cursor_id)?;
-        if len > 0 {
-            let bytes = host.read_mem(ptr, 8)?;
-            let c: Cursor = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
-            cursor = c;
-        }
-    }
-
-    guest_dealloc(host, query_ptr, 4);
-    guest_dealloc(host, out_ptr, 4);
-
-    Ok(cursor)
+struct AppState {
+    screen: AppScreen,
+    menu_index: usize,
+    // We hold the host here so we can tick it
+    host: Option<BlindHost>,
 }
 
 fn main() -> Result<()> {
-    // 1. Setup Terminal
-    stdout().execute(EnterAlternateScreen)?;
+    // 1. Terminal Setup
     enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-    // 2. Setup Host
-    let config = BlindHostConfig::default();
-    let mut host = BlindHost::new(config, |_, _| Ok(()))?;
-
-    // 3. Load Plugins
-    let core_path = "target/wasm32-unknown-unknown/release/ecs_core.wasm";
-    let game_path = "target/wasm32-unknown-unknown/release/my_game.wasm";
-
-    let load_wasm = |path: &str| -> Result<Vec<u8>> {
-        fs::read(path).with_context(|| format!("Could not find WASM at '{}'", path))
+    let mut app_state = AppState {
+        screen: AppScreen::Menu,
+        menu_index: 0,
+        host: None,
     };
 
-    host.load_plugin("ecs_core", &load_wasm(core_path)?)?;
-    host.load_plugin("minesweeper", &load_wasm(game_path)?)?;
-
-    // 4. Handshake (Get IDs)
-    let get_ids_fn = host
-        .get_func("ecs_core", "get_standard_ids")?
-        .typed::<(), i64>(&mut host.store)?;
-    let ptr = get_ids_fn.call(&mut host.store, ())?;
-
-    let bytes = host.read_mem(ptr as i32, 12)?;
-    let ids: StandardIds = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
-
-    // 5. Get Game Functions (Input & Tick)
-    let input_fn = host
-        .get_func("minesweeper", "on_input")?
-        .typed::<i32, ()>(&mut host.store)?;
-
-    // CRITICAL FIX: We need to "tick" the game engine so systems run!
-    // Try to get "tick" or "update". If your game exports "update", change this string.
-    let tick_fn = host
-        .get_func("minesweeper", "tick")
-        .or_else(|_| host.get_func("minesweeper", "update"))
-        .context("Could not find 'tick' or 'update' function in minesweeper plugin")?
-        .typed::<(), ()>(&mut host.store)?;
-
-    let mut tiles: Vec<(Position, Tile)> = Vec::with_capacity(100);
-
-    // 6. Main Loop
+    // 2. Main Loop
     loop {
-        // --- GAME LOGIC ---
-        // Run the game systems (Spawn entities, handle logic, etc.)
-        tick_fn.call(&mut host.store, ())?;
-
-        // --- RENDER ---
+        // A. Draw
         terminal.draw(|frame| {
             let area = frame.area();
-            let mut cursor = Cursor { x: 0, y: 0 };
-
-            // Fetch data *after* the tick so we see the results of this frame
-            let _ = fetch_game_data(&mut host, ids.tile_id, ids.position_id, &mut tiles);
-            if let Ok(c) = fetch_cursor(&mut host, ids.cursor_id) {
-                cursor = c;
-            }
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Minesweeper (Entities: {}) ", tiles.len()));
-            let inner_area = block.inner(area);
-            frame.render_widget(block, area);
-
-            for (pos, tile) in &tiles {
-                // Ensure coordinates don't overflow the UI area
-                let x = inner_area.x + (pos.x as u16 * 3);
-                let y = inner_area.y + (pos.y as u16);
-
-                if x >= inner_area.right() || y >= inner_area.bottom() {
-                    continue;
-                }
-
-                let symbol = match tile.status {
-                    TileStatus::Hidden => " · ",
-                    TileStatus::Flagged => " 🚩",
-                    TileStatus::Revealed => {
-                        if tile.is_mine {
-                            " 💣"
+            match app_state.screen {
+                AppScreen::Menu => render_menu(frame, area, &app_state),
+                AppScreen::Game => {
+                    if let Some(host) = &mut app_state.host {
+                        // In a real app, you might want to separate "Update" from "Render".
+                        // Here, we just peek at the memory to render.
+                        if let Ok(grid) = read_grid_from_host(host) {
+                            render_game(frame, area, &grid);
                         } else {
-                            "   "
+                            // Fallback if read fails
+                            frame.render_widget(Paragraph::new("Error reading Grid"), area);
                         }
                     }
-                };
-
-                let style = if pos.x == cursor.x && pos.y == cursor.y {
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else if tile.status == TileStatus::Revealed && tile.is_mine {
-                    Style::default().bg(Color::Red)
-                } else {
-                    Style::default()
-                };
-
-                frame.render_widget(Paragraph::new(symbol).style(style), Rect::new(x, y, 3, 1));
+                }
+                _ => {}
             }
         })?;
 
-        // --- INPUT ---
-        if event::poll(std::time::Duration::from_millis(16))? {
+        // B. Input
+        if event::poll(Duration::from_millis(30))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => break,
-                        KeyCode::Char('c')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            break
-                        }
-
-                        // Vim Motion Support added here!
-                        KeyCode::Up | KeyCode::Char('k') => input_fn.call(&mut host.store, 0)?,
-                        KeyCode::Down | KeyCode::Char('j') => input_fn.call(&mut host.store, 1)?,
-                        KeyCode::Left | KeyCode::Char('h') => input_fn.call(&mut host.store, 2)?,
-                        KeyCode::Right | KeyCode::Char('l') => input_fn.call(&mut host.store, 3)?,
-
-                        KeyCode::Char(' ') => input_fn.call(&mut host.store, 4)?, // Reveal
-                        KeyCode::Char('f') => input_fn.call(&mut host.store, 5)?, // Flag
+                    match app_state.screen {
+                        AppScreen::Menu => handle_menu_input(&mut app_state, key.code)?,
+                        AppScreen::Game => handle_game_input(&mut app_state, key.code)?,
                         _ => {}
                     }
                 }
             }
         }
-    }
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
-}
-
-// --- ALLOCATOR HELPERS ---
-
-const WASM_PAGE_SIZE: u64 = 65536;
-const GROWTH_CHUNK_SIZE: u64 = 80;
-const HEAP_START_ADDR: u32 = 32 * 1024 * 1024;
-
-fn guest_alloc(host: &mut BlindHost, size: i32) -> Result<i32> {
-    let size = (size as u32 + 7) & !7;
-
-    // 1. Try Alloc
-    {
-        let mut heap = host.store.data().heap.lock().unwrap();
-        if let Some(addr) = heap.alloc(size) {
-            return Ok(addr as i32);
+        if app_state.screen == AppScreen::Exiting {
+            break;
         }
     }
 
-    // 2. Grow Memory if needed
-    let memory = host.store.data().shared_memory.clone();
-
-    // FIX: Remove &host.store argument
-    let current_mem_size = memory.size() * WASM_PAGE_SIZE;
-
-    // We must check if heap is empty to determine start addr
-    let heap_is_empty = host
-        .store
-        .data()
-        .heap
-        .lock()
-        .unwrap()
-        .free_blocks
-        .is_empty();
-
-    let growth_start_addr = if heap_is_empty && current_mem_size < HEAP_START_ADDR as u64 {
-        HEAP_START_ADDR
-    } else {
-        current_mem_size as u32
-    };
-
-    let required_growth = std::cmp::max(
-        GROWTH_CHUNK_SIZE,
-        (size as u64 + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE,
-    );
-
-    // FIX: Remove &mut host.store argument
-    memory.grow(required_growth)?;
-
-    let new_block_size = (required_growth * WASM_PAGE_SIZE) as u32;
-
-    // 3. Register new memory and alloc again
-    {
-        let mut heap = host.store.data().heap.lock().unwrap();
-        heap.dealloc(growth_start_addr, new_block_size);
-        Ok(heap.alloc(size).unwrap_or(0) as i32)
-    }
+    // 3. Cleanup
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
 }
 
-fn guest_dealloc(host: &mut BlindHost, ptr: i32, size: i32) {
-    if ptr == 0 {
-        return;
+// --- LOGIC: HOST INTEGRATION ---
+
+fn init_game_host() -> Result<BlindHost> {
+    // 1. Create BlindHost
+    let config = BlindHostConfig::default();
+    let mut host = BlindHost::new(config, |_, _| Ok(()))?;
+
+    // 2. Load Kernel (ecs-core)
+    // This provides the 'sys_resource' and memory management infrastructure
+    let core_wasm = fs::read("../target/wasm32-unknown-unknown/release/ecs_core.wasm")
+        .context("Failed to read ecs_core.wasm")?;
+    host.load_plugin("ecs-core", &core_wasm)?;
+
+    // 3. Load Game (my-game)
+    let game_wasm = fs::read("../target/wasm32-unknown-unknown/release/my_game.wasm")
+        .context("Failed to read my_game.wasm")?;
+    host.load_plugin("my-game", &game_wasm)?;
+
+    // 4. Initialize Game Plugin
+    // The register_plugin! macro usually creates 'plugin_init'
+    let init_func = host.get_func("my-game", "plugin_init")?;
+    init_func
+        .typed::<(), ()>(&mut host.store)?
+        .call(&mut host.store, ())?;
+
+    Ok(host)
+}
+
+fn tick_game(host: &mut BlindHost, input: InputState) -> Result<()> {
+    // 1. Get pointer to Input Resource from ECS Kernel
+    // We call ecs-core.sys_resource(ID, SIZE)
+    let sys_res = host.get_func("ecs-core", "sys_resource")?;
+    let ptr_i32 = sys_res.typed::<(i32, i32), i32>(&mut host.store)?.call(
+        &mut host.store,
+        (INPUT_RES_ID, std::mem::size_of::<InputState>() as i32),
+    )?;
+
+    // 2. Write Input Data
+    if ptr_i32 != 0 {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &input as *const _ as *const u8,
+                std::mem::size_of::<InputState>(),
+            )
+        };
+        host.write_mem(ptr_i32, bytes)?;
     }
-    let ptr = ptr as u32;
-    let size = (size as u32 + 7) & !7;
-    host.store.data().heap.lock().unwrap().dealloc(ptr, size);
+
+    // 3. Update Game Logic
+    let update_func = host.get_func("my-game", "plugin_update")?;
+    update_func
+        .typed::<(), ()>(&mut host.store)?
+        .call(&mut host.store, ())?;
+
+    Ok(())
+}
+
+fn read_grid_from_host(host: &mut BlindHost) -> Result<GameGrid> {
+    // 1. Get pointer to Grid
+    // The plugin exports a helper 'get_grid_ptr' (via export_grid! macro)
+    let get_ptr = host.get_func("my-game", "get_grid_ptr")?;
+    let ptr = get_ptr
+        .typed::<(), i32>(&mut host.store)?
+        .call(&mut host.store, ())?;
+
+    // 2. Read Bytes
+    let bytes = host.read_mem(ptr, std::mem::size_of::<GameGrid>() as i32)?;
+
+    // 3. Cast to Struct (Safety: BlindHost copy ensures alignment is handled by Vec usually)
+    // To be strictly safe against alignment issues, we should use `ptr::read_unaligned`,
+    // but for this demo, direct pointer casting of the buffer works if struct is simple.
+    let grid = unsafe { std::ptr::read(bytes.as_ptr() as *const GameGrid) };
+    Ok(grid)
+}
+
+// --- UI HANDLERS ---
+
+fn handle_menu_input(state: &mut AppState, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if state.menu_index > 0 {
+                state.menu_index -= 1
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.menu_index < 1 {
+                state.menu_index += 1
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => match state.menu_index {
+            0 => {
+                // Load and Switch
+                state.host = Some(init_game_host()?);
+                state.screen = AppScreen::Game;
+            }
+            1 => state.screen = AppScreen::Exiting,
+            _ => {}
+        },
+        KeyCode::Char('q') => state.screen = AppScreen::Exiting,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_game_input(state: &mut AppState, key: KeyCode) -> Result<()> {
+    if let Some(host) = &mut state.host {
+        let mut input = InputState {
+            dx: 0,
+            dy: 0,
+            reveal: false,
+            flag: false,
+        };
+
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.screen = AppScreen::Menu;
+                state.host = None; // Unload
+                return Ok(());
+            }
+            KeyCode::Char('r') => {
+                // Reload
+                state.host = Some(init_game_host()?);
+                return Ok(());
+            }
+            KeyCode::Up | KeyCode::Char('k') => input.dy = -1,
+            KeyCode::Down | KeyCode::Char('j') => input.dy = 1,
+            KeyCode::Left | KeyCode::Char('h') => input.dx = -1,
+            KeyCode::Right | KeyCode::Char('l') => input.dx = 1,
+            KeyCode::Char(' ') => input.reveal = true,
+            KeyCode::Char('f') => input.flag = true,
+            _ => {}
+        }
+
+        tick_game(host, input)?;
+    }
+    Ok(())
+}
+
+// --- RENDERING ---
+
+fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
+    let layout = Layout::vertical([
+        Constraint::Percentage(40),
+        Constraint::Length(10),
+        Constraint::Min(0),
+    ])
+    .split(area);
+
+    let title = Paragraph::new("BLIND HOST LAUNCHER")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center);
+    frame.render_widget(title, layout[0]);
+
+    let items = vec!["Start Minesweeper", "Quit"];
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let style = if i == state.menu_index {
+                Style::default().bg(Color::Cyan).fg(Color::Black)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(format!(" {} ", t)).style(style)
+        })
+        .collect();
+
+    frame.render_widget(
+        List::new(list_items).block(Block::default().borders(Borders::NONE)),
+        Layout::horizontal([
+            Constraint::Percentage(40),
+            Constraint::Percentage(20),
+            Constraint::Percentage(40),
+        ])
+        .split(layout[1])[1],
+    );
+}
+
+fn render_game(frame: &mut Frame, area: Rect, grid: &GameGrid) {
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    // Status
+    let status_text = if grid.game_over {
+        "💥 GAME OVER 💥 (Press 'R' to Restart)".red().bold()
+    } else {
+        Span::raw(format!("Cursor: {},{}", grid.cursor_x, grid.cursor_y))
+    };
+    frame.render_widget(
+        Paragraph::new(status_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Minesweeper "),
+            )
+            .alignment(Alignment::Center),
+        layout[0],
+    );
+
+    // Board
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(layout[1]);
+    frame.render_widget(block, layout[1]);
+
+    let offset_x = inner.x + (inner.width.saturating_sub((grid.width * 3) as u16) / 2);
+    let offset_y = inner.y + (inner.height.saturating_sub(grid.height as u16) / 2);
+
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            if x < 0 || y < 0 || x >= 32 || y >= 16 {
+                continue;
+            }
+
+            let idx = (y * 32 + x) as usize;
+            let cell = &grid.cells[idx];
+
+            let draw_x = offset_x + (x as u16 * 3);
+            let draw_y = offset_y + (y as u16);
+
+            if draw_x >= inner.right() || draw_y >= inner.bottom() {
+                continue;
+            }
+
+            let is_cursor = x == grid.cursor_x && y == grid.cursor_y;
+
+            let (sym, mut style) = match (cell.is_revealed, cell.is_flagged) {
+                (false, true) => (" 🚩", Style::default().fg(Color::Red)),
+                (false, false) => (" · ", Style::default().fg(Color::DarkGray)),
+                (true, _) => {
+                    if cell.is_mine {
+                        (" 💣", Style::default().bg(Color::Red))
+                    } else {
+                        match cell.neighbors {
+                            0 => ("   ", Style::default()),
+                            1 => (" 1 ", Style::default().fg(Color::Blue)),
+                            2 => (" 2 ", Style::default().fg(Color::Green)),
+                            3 => (" 3 ", Style::default().fg(Color::Red)),
+                            _ => (" ? ", Style::default().fg(Color::Yellow)),
+                        }
+                    }
+                }
+            };
+
+            if is_cursor {
+                style = style.bg(Color::White).fg(Color::Black);
+            }
+
+            frame.render_widget(
+                Paragraph::new(sym).style(style),
+                Rect::new(draw_x, draw_y, 3, 1),
+            );
+        }
+    }
+
+    // Footer
+    frame.render_widget(
+        Paragraph::new("Arrows: Move | Space: Reveal | F: Flag | R: Restart | Q: Quit")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        layout[2],
+    );
 }
