@@ -10,3 +10,6 @@ anyhow = "1.0"
 buddy-alloc = "0.4" 
 libc = "0.2" # Often needed for raw pointer casts
 wasmparser = "0.243.0"
+ratatui = "0.29.0"
+crossterm = "0.29.0"
+ecs-protocol = { path = "../crates/ecs-protocol" }

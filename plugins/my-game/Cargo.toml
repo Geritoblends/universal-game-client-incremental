@@ -9,3 +9,4 @@ crate-type = ["cdylib"] # Compiles to .wasm
 [dependencies]
 tasksapp_allocator = { path = "../../crates/allocator" }
 tasksapp_ecs_client = { path = "../../crates/ecs-client" }
+ecs-protocol = { path = "../../crates/ecs-protocol" }

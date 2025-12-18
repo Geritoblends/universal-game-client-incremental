@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = ["crates/ecs-protocol",
     "host",
     "plugins/ecs-core",
     "plugins/my-game"

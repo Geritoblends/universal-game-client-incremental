@@ -1,3 +1,4 @@
+use ecs_protocol::{StandardIds, CAPABILITY_TUI};
 use once_cell::sync::Lazy;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::alloc::{GlobalAlloc, Layout};
@@ -31,6 +32,10 @@ unsafe impl GlobalAlloc for HostAllocator {
 
 #[global_allocator]
 static ALLOCATOR: HostAllocator = HostAllocator;
+
+static mut POS_ID: i32 = -1;
+static mut TILE_ID: i32 = -1; // Was VEL_ID
+static mut CURSOR_ID: i32 = -1; // Was SPRITE_ID
 
 // --- UTILS ---
 fn print(s: &str) {
@@ -321,6 +326,36 @@ pub extern "C" fn get_table_column(table_idx: i32, comp_id: i32) -> i64 {
 }
 
 #[no_mangle]
+pub extern "C" fn get_standard_ids() -> i64 {
+    unsafe {
+        let ids = StandardIds {
+            position_id: POS_ID,
+            tile_id: TILE_ID,
+            cursor_id: CURSOR_ID,
+        };
+
+        // Allocate memory in WASM for the struct so Host can read it
+        let ptr = host_alloc(std::mem::size_of::<StandardIds>() as i32);
+        let slice = std::slice::from_raw_parts_mut(ptr as *mut StandardIds, 1);
+        slice[0] = ids;
+
+        ptr as i64
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn set_standard_id(kind: i32, id: i32) {
+    unsafe {
+        match kind {
+            1 => POS_ID = id,    // Position
+            2 => TILE_ID = id,   // Tile
+            3 => CURSOR_ID = id, // Cursor
+            _ => {}
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn rebuild_schedule() {
     let mut world = WORLD.lock().unwrap();
     let mut stage = Stage {
@@ -350,4 +385,12 @@ pub extern "C" fn run_schedule() {
     for sys in systems_to_run {
         sys(0);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn tick(delta: f32) {
+    // In a real scenario, we might put 'delta' into a Singleton Resource here
+
+    // Run the schedule (Logic Systems)
+    run_schedule();
 }

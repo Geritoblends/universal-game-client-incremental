@@ -44,7 +44,10 @@ pub struct BlindHost {
 }
 
 impl BlindHost {
-    pub fn new(config: BlindHostConfig) -> Result<Self> {
+    pub fn new<F>(config: BlindHostConfig, setup_linker: F) -> Result<Self>
+    where
+        F: FnOnce(&mut Linker<HostState>, &mut Store<HostState>) -> Result<()>,
+    {
         let mut wasm_config = Config::new();
         wasm_config.wasm_threads(true);
         let engine = Engine::new(&wasm_config)?;
@@ -67,20 +70,20 @@ impl BlindHost {
 
         let initial_pages = needed_pages + safety_buffer_pages;
 
-        println!("⚙️ [HOST] Memory Optimization:");
-        println!(
-            "   ├── Reserved for Slots: {:.2} MB ({} Pages)",
-            needed_pages as f32 * 64.0 / 1024.0,
-            needed_pages
-        );
-        println!(
-            "   ├── Runtime Buffer:     2.00 MB ({} Pages)",
-            safety_buffer_pages
-        );
-        println!(
-            "   └── Total Allocation:   {:.2} MB",
-            initial_pages as f32 * 64.0 / 1024.0
-        );
+        // println!("⚙️ [HOST] Memory Optimization:");
+        // println!(
+        //     "   ├── Reserved for Slots: {:.2} MB ({} Pages)",
+        //     needed_pages as f32 * 64.0 / 1024.0,
+        //     needed_pages
+        // );
+        // println!(
+        //     "   ├── Runtime Buffer:     2.00 MB ({} Pages)",
+        //     safety_buffer_pages
+        // );
+        // println!(
+        //     "   └── Total Allocation:   {:.2} MB",
+        //     initial_pages as f32 * 64.0 / 1024.0
+        // );
 
         // --- 3. CREATE MEMORY ---
         let memory = SharedMemory::new(&engine, MemoryType::shared(initial_pages as u32, 16384))?;
@@ -107,6 +110,8 @@ impl BlindHost {
         linker.func_wrap("env", "host_alloc", host_alloc)?;
         linker.func_wrap("env", "host_dealloc", host_dealloc)?;
 
+        setup_linker(&mut linker, &mut store)?;
+
         Ok(Self {
             engine,
             store,
@@ -116,7 +121,7 @@ impl BlindHost {
 
     // load_plugin remains exactly the same as your working version
     pub fn load_plugin(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<Instance> {
-        println!("📦 [HOST] Loading Plugin: {}", name);
+        // println!("📦 [HOST] Loading Plugin: {}", name);
         let module = Module::new(&self.engine, wasm_bytes)?;
         let instance_linker = self.prepare_env(name)?;
         let instance = instance_linker.instantiate(&mut self.store, &module)?;
@@ -159,7 +164,7 @@ impl BlindHost {
 
         // Safety Check
         if slot_base + slot_size > heap_limit {
-            return Err(anyhow::anyhow!("❌ Out of Module Slots!"));
+            return Err(anyhow!("❌ Out of Module Slots!"));
         }
 
         let my_data_start = slot_base;
@@ -168,8 +173,8 @@ impl BlindHost {
         // Advance Pointers
         self.store.data_mut().next_memory_offset += slot_size;
 
-        println!("       ├── Slot Base:  {:#X}", slot_base);
-        println!("       └── Stack Top:  {:#X}", my_stack_top);
+        // println!("       ├── Slot Base:  {:#X}", slot_base);
+        // println!("       └── Stack Top:  {:#X}", my_stack_top);
 
         let mut linker = self.linker.clone();
 
@@ -243,27 +248,27 @@ impl BlindHost {
                     .data()
                     .instances
                     .get(&provider_mod)
-                    .ok_or(anyhow::anyhow!("Provider '{}' not found", provider_mod))?
+                    .ok_or(anyhow!("Provider '{}' not found", provider_mod))?
                     .clone();
 
                 let func = provider_instance
                     .get_func(&mut c, &provider_func)
-                    .ok_or(anyhow::anyhow!("Export '{}' not found", provider_func))?;
+                    .ok_or(anyhow!("Export '{}' not found", provider_func))?;
 
                 let caller_table = c
                     .data()
                     .tables
                     .get(&caller_name)
-                    .ok_or(anyhow::anyhow!("Table for '{}' not found", caller_name))?
+                    .ok_or(anyhow!("Table for '{}' not found", caller_name))?
                     .clone();
 
                 let new_idx = caller_table.size(&mut c);
                 caller_table.grow(&mut c, 1, Ref::Func(Some(func)))?;
 
-                println!(
-                    "🔗 [HOST] Linked {}::{} -> {}::Table[{}]",
-                    provider_mod, provider_func, caller_name, new_idx
-                );
+                // println!(
+                //     "🔗 [HOST] Linked {}::{} -> {}::Table[{}]",
+                //     provider_mod, provider_func, caller_name, new_idx
+                // );
                 Ok(new_idx as i32)
             },
         )?;
@@ -277,10 +282,55 @@ impl BlindHost {
             .data()
             .instances
             .get(module_name)
-            .ok_or(anyhow::anyhow!("Instance not found"))?
+            .ok_or(anyhow!("Instance not found"))?
             .clone();
         instance
             .get_func(&mut self.store, func_name)
-            .ok_or(anyhow::anyhow!("Function not found"))
+            .ok_or(anyhow!("Function not found"))
+    }
+
+    pub fn read_mem(&mut self, ptr: i32, len: i32) -> Result<Vec<u8>> {
+        // 1. Get the shared memory handle from the store data
+        let memory = &self.store.data().shared_memory;
+
+        // 2. Get the raw data (In Wasmtime 21+, this returns &[UnsafeCell<u8>])
+        let data_cells = memory.data();
+
+        // 3. SAFETY: Cast UnsafeCell<u8> to u8.
+        // This is safe because our Host is single-threaded relative to the WASM execution.
+        let data: &[u8] = unsafe {
+            std::slice::from_raw_parts(data_cells.as_ptr() as *const u8, data_cells.len())
+        };
+
+        // 4. Perform bounds checking
+        let start = ptr as usize;
+        let end = start + len as usize;
+
+        if end > data.len() {
+            anyhow::bail!("Memory access out of bounds: {} > {}", end, data.len());
+        }
+
+        // 5. Copy the data
+        Ok(data[start..end].to_vec())
+    }
+
+    pub fn write_mem(&mut self, ptr: i32, data: &[u8]) -> Result<()> {
+        let memory = &self.store.data().shared_memory;
+        let mem_cells = memory.data();
+
+        // Safety: Cast to mutable u8 slice
+        let mem_slice: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(mem_cells.as_ptr() as *mut u8, mem_cells.len())
+        };
+
+        let start = ptr as usize;
+        let end = start + data.len();
+
+        if end > mem_slice.len() {
+            anyhow::bail!("Memory write out of bounds");
+        }
+
+        mem_slice[start..end].copy_from_slice(data);
+        Ok(())
     }
 }

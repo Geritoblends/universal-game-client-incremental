@@ -16,6 +16,7 @@ mod ffi {
         pub fn spawn_entity() -> i32;
         pub fn add_component(entity_id: i32, comp_id: i32, data_ptr: i32);
         pub fn register_system(mod_ptr: i32, mod_len: i32, fn_ptr: i32, fn_len: i32);
+        pub fn set_standard_id(kind: i32, id: i32);
     }
 }
 
@@ -58,6 +59,10 @@ pub fn add_component<T: Component>(entity: i32, component: &T) {
     }
 }
 
+pub trait StandardComponent: Component {
+    const KIND: i32;
+}
+
 pub fn register_component<T: Component>() {
     unsafe {
         ffi::register_component(
@@ -65,6 +70,13 @@ pub fn register_component<T: Component>() {
             std::mem::size_of::<T>() as i32,
             std::mem::align_of::<T>() as i32,
         );
+    }
+}
+
+pub fn register_std_component<T: StandardComponent>() {
+    register_component::<T>();
+    unsafe {
+        ffi::set_standard_id(T::KIND, T::ID);
     }
 }
 

@@ -1,69 +1,162 @@
+use ecs_protocol::{self as proto, TileStatus};
+use std::ops::{Deref, DerefMut};
 use tasksapp_ecs_client::*;
 
-// --- 1. Define Components ---
+// --- WRAPPERS (The Orphan Rule Fix) ---
+// #[repr(transparent)] ensures these have the EXACT same memory layout
+// as the inner struct, so the WASM raw pointer casts still work safely.
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct Position {
-    pub x: f32,
-    pub y: f32,
-}
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Position(pub proto::Position);
 
-// We must implement the Component trait from your client
 impl Component for Position {
     const ID: i32 = 1;
 }
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct Velocity {
-    pub dx: f32,
-    pub dy: f32,
+impl StandardComponent for Position {
+    const KIND: i32 = 1;
 }
 
-impl Component for Velocity {
+// Enable accessing .x and .y directly
+impl Deref for Position {
+    type Target = proto::Position;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for Position {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Tile(pub proto::Tile);
+
+impl Component for Tile {
     const ID: i32 = 2;
 }
-
-// --- 2. Define System ---
-
-// The function signature matches 'extern "C" fn(i32)'
-#[no_mangle]
-pub extern "C" fn MovementSystem(_: i32) {
-    // Create the query. Internally, this calls ffi::query_archetypes
-    let query = Query::<(&mut Position, &Velocity)>::new();
-
-    query.for_each(|(pos, vel)| {
-        pos.x += vel.dx;
-        pos.y += vel.dy;
-
-        // Since ecs_client sets up the GlobalAllocator, we can use format!
-        let msg = format!("🏃 [GAME] Entity moved to: ({:.2}, {:.2})", pos.x, pos.y);
-        print(&msg);
-    });
+impl StandardComponent for Tile {
+    const KIND: i32 = 2;
 }
 
-// --- 3. Initialize ---
+impl Deref for Tile {
+    type Target = proto::Tile;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for Tile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Cursor(pub proto::Cursor);
+
+impl Component for Cursor {
+    const ID: i32 = 3;
+}
+impl StandardComponent for Cursor {
+    const KIND: i32 = 3;
+}
+
+impl Deref for Cursor {
+    type Target = proto::Cursor;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for Cursor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// --- GAME LOGIC ---
 
 #[no_mangle]
 pub extern "C" fn init() {
-    print("🎮 [GAME] Initializing...");
+    register_std_component::<Position>();
+    register_std_component::<Tile>();
+    register_std_component::<Cursor>();
 
-    // A. Register Components
-    register_component::<Position>();
-    register_component::<Velocity>();
+    // 1. Spawn Cursor
+    let c = spawn_entity();
+    add_component(c, &Cursor(proto::Cursor { x: 5, y: 5 }));
 
-    // B. Register System
-    // We pass the function pointer directly.
-    // Note: The generic <(...)> is just for type safety/metadata in your API.
-    register_system::<(&mut Position, &Velocity)>("Game", "MovementSystem", MovementSystem);
+    // 2. Generate Grid (10x10)
+    let mut rng: u32 = 12345;
 
-    // C. Spawn Entity
-    let e = spawn_entity();
+    for y in 0..10 {
+        for x in 0..10 {
+            // All literals here are valid u32
+            rng = (rng.wrapping_mul(1103515245).wrapping_add(12345)) % 2147483648;
 
-    // D. Add Components
-    add_component(e, &Position { x: 0.0, y: 0.0 });
-    add_component(e, &Velocity { dx: 1.5, dy: 0.5 });
+            // Cast back to logic for the boolean check
+            let is_mine = (rng % 10) == 0;
 
-    print("✨ [GAME] Entity spawned.");
+            let e = spawn_entity();
+            add_component(e, &Position(proto::Position { x, y }));
+            add_component(
+                e,
+                &Tile(proto::Tile {
+                    is_mine,
+                    adjacent_mines: 0,
+                    status: TileStatus::Hidden,
+                }),
+            );
+        }
+    }
 }
+
+#[no_mangle]
+pub extern "C" fn on_input(code: i32) {
+    let query_cursor = Query::<(&mut Cursor)>::new();
+    let query_tiles = Query::<(&Position, &mut Tile)>::new();
+
+    // 1. Move Cursor
+    let mut cx = 0;
+    let mut cy = 0;
+
+    query_cursor.for_each(|cursor| {
+        match code {
+            0 => cursor.y = (cursor.y - 1).max(0),
+            1 => cursor.y = (cursor.y + 1).min(9),
+            2 => cursor.x = (cursor.x - 1).max(0),
+            3 => cursor.x = (cursor.x + 1).min(9),
+            _ => {}
+        }
+        cx = cursor.x;
+        cy = cursor.y;
+    });
+
+    // 2. Interact with Tile
+    if code == 4 || code == 5 {
+        // Reveal or Flag
+        query_tiles.for_each(|(pos, tile)| {
+            if pos.x == cx && pos.y == cy {
+                if code == 5 {
+                    // Toggle Flag
+                    tile.status = match tile.status {
+                        TileStatus::Hidden => TileStatus::Flagged,
+                        TileStatus::Flagged => TileStatus::Hidden,
+                        _ => tile.status,
+                    };
+                } else if code == 4 && tile.status == TileStatus::Hidden {
+                    // Reveal
+                    tile.status = TileStatus::Revealed;
+                    if tile.is_mine {
+                        print("BOOM! Game Over.");
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tick(_dt: f32) {}
