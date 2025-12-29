@@ -13,6 +13,14 @@ build:
 		--target wasm32-unknown-unknown \
 		--release
 
+build-grid:
+	@echo "Building Grid Driver (Wasm)..."
+	cargo +nightly build \
+		-Z build-std=std,panic_abort \
+		-p grid-driver \
+		--target wasm32-unknown-unknown \
+		--release
+
 run: build
 	@echo "Running Host (Native)..."
 	cargo run --release -p host

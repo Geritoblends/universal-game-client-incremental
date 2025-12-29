@@ -1,8 +1,10 @@
 [workspace]
 members = ["crates/ecs-protocol",
+    "crates/grid-protocol",
     "host",
-    "plugins/ecs-core",
-    "plugins/my-game"
+    # "plugins/ecs-core",
+    "plugins/grid-driver",
+    # "plugins/my-game"
 ]
 resolver = "2"
 

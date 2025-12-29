@@ -12,4 +12,6 @@ libc = "0.2" # Often needed for raw pointer casts
 wasmparser = "0.243.0"
 ratatui = "0.29.0"
 crossterm = "0.29.0"
+bytemuck = "1.13"
 ecs-protocol = { path = "../crates/ecs-protocol" }
+grid-protocol = { path = "../crates/grid-protocol" }
