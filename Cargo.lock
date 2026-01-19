@@ -1331,6 +1331,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "snake"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "grid-protocol",
+ "once_cell",
+ "tasksapp_allocator",
+]
+
+[[package]]
 name = "sptr"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

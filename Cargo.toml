@@ -4,6 +4,7 @@ members = ["crates/ecs-protocol",
     "host",
     # "plugins/ecs-core",
     "plugins/grid-driver",
+    "plugins/snake",
     # "plugins/my-game"
 ]
 resolver = "2"

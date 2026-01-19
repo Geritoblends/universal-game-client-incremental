@@ -79,24 +79,24 @@ fn main() -> Result<()> {
 
     // 3. Load the Driver Plugin
     // We expect the WASM to be built in the target directory
-    let wasm_path = "target/wasm32-unknown-unknown/release/grid_driver.wasm";
+    let wasm_path = "target/wasm32-unknown-unknown/release/snake.wasm";
     if !std::path::Path::new(wasm_path).exists() {
         // Fallback or Error
         eprintln!("❌ Error: WASM driver not found at '{}'", wasm_path);
-        eprintln!("   Please run: cargo build -p grid-driver --target wasm32-unknown-unknown --release");
+        eprintln!("   Please run: cargo build -p snake --target wasm32-unknown-unknown --release");
         return Ok(());
     }
     
-    let wasm_bytes = std::fs::read(wasm_path).context("Failed to read grid_driver.wasm")?;
-    host.load_plugin("grid-driver", &wasm_bytes)?;
+    let wasm_bytes = std::fs::read(wasm_path).context("Failed to read snake.wasm")?;
+    host.load_plugin("snake", &wasm_bytes)?;
 
     // 4. Bind Exports
     // Typed functions for performance and type safety
-    let tick_fn: TypedFunc<(f32,), ()> = host.get_func("grid-driver", "tick")?.typed(&host.store)?;
-    let set_input_fn: TypedFunc<(i32,), ()> = host.get_func("grid-driver", "set_input")?.typed(&host.store)?;
-    let set_tickrate_fn: TypedFunc<(f32,), ()> = host.get_func("grid-driver", "set_tickrate")?.typed(&host.store)?;
-    let get_dims_fn: TypedFunc<(), i64> = host.get_func("grid-driver", "get_grid_dimensions")?.typed(&host.store)?;
-    let get_ptr_fn: TypedFunc<(), i32> = host.get_func("grid-driver", "get_grid_ptr")?.typed(&host.store)?;
+    let tick_fn: TypedFunc<(f32,), ()> = host.get_func("snake", "tick")?.typed(&host.store)?;
+    let set_input_fn: TypedFunc<(i32,), ()> = host.get_func("snake", "set_input")?.typed(&host.store)?;
+    let set_tickrate_fn: TypedFunc<(f32,), ()> = host.get_func("snake", "set_tickrate")?.typed(&host.store)?;
+    let get_dims_fn: TypedFunc<(), i64> = host.get_func("snake", "get_grid_dimensions")?.typed(&host.store)?;
+    let get_ptr_fn: TypedFunc<(), i32> = host.get_func("snake", "get_grid_ptr")?.typed(&host.store)?;
 
     // 5. Allocate Input Buffer in Shared Memory
     // The driver reads from this pointer. We write to it.
@@ -116,22 +116,20 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // 7. Main Loop
-    let mut tick_rate = 0.0; // Hz. 0.0 means "input driven"
+    let mut tick_rate = 60.0; // Hz. 0.0 means "input driven"
     
     // Notify driver of initial tickrate
     set_tickrate_fn.call(&mut host.store, (tick_rate,))?;
 
     let mut last_tick = Instant::now();
     let mut should_quit = false;
+    let mut pending_input = GridInput::default();
 
     // Initial tick to render something
     tick_fn.call(&mut host.store, (0.0,))?;
 
     loop {
         if should_quit { break; }
-
-        let mut input_val = GridInput::default();
-        let mut input_received = false;
 
         // --- Event Polling ---
         // If tick_rate is 0, we block (wait) for input to save CPU.
@@ -149,8 +147,8 @@ fn main() -> Result<()> {
                     if key.code == KeyCode::Esc {
                         should_quit = true;
                     }
-                    input_val = map_key(key);
-                    input_received = true;
+                    // Store the latest input to be processed on the next tick
+                    pending_input = map_key(key);
                 }
                 _ => {} // Ignore mouse/resize for MVP
             }
@@ -158,8 +156,8 @@ fn main() -> Result<()> {
 
         // --- Ticking Logic ---
         let should_tick = if tick_rate == 0.0 {
-            // Tick only if we got input
-            input_received
+            // Tick only if we have pending input (and it's a key)
+            pending_input.input_type == INPUT_KEY
         } else {
             // Tick if enough time passed
             last_tick.elapsed().as_secs_f32() >= (1.0 / tick_rate)
@@ -167,11 +165,14 @@ fn main() -> Result<()> {
 
         if should_tick {
              // 1. Update Input in WASM Memory
-             let bytes = bytemuck::bytes_of(&input_val);
+             let bytes = bytemuck::bytes_of(&pending_input);
              host.write_mem(input_ptr, bytes)?;
              
              // 2. Notify Driver of Input Pointer
              set_input_fn.call(&mut host.store, (input_ptr,))?;
+
+             // Reset pending input after sending
+             pending_input = GridInput::default();
 
              // 3. Call Tick
              // Calculate delta if needed, for now fixed or actual elapsed
